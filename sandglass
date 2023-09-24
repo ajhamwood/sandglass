@@ -1,0 +1,194 @@
+#!/usr/bin/env python
+
+from enum import Enum
+import serial
+import signal
+
+def interrupt(signum, frame):
+    print("\nExiting")
+    exit(1)
+
+signal.signal(signal.SIGINT, interrupt)
+
+def fail(msg):
+    print("\nFailed with error:\n\t" + msg)
+    exit(1)
+
+
+frame_constants = {
+    "5": serial.FIVEBITS,
+    "6": serial.SIXBITS,
+    "7": serial.SEVENBITS,
+    "8": serial.EIGHTBITS,
+    "N": serial.PARITY_NONE,
+    "E": serial.PARITY_EVEN,
+    "O": serial.PARITY_ODD,
+    "1": serial.STOPBITS_ONE,
+    "2": serial.STOPBITS_TWO
+}
+
+class UpSignals(Enum):
+    UPLOAD_REQUEST = 1
+    UPLOAD_WITH_SAVE_REQUEST = 2
+    CHECK_EEPROM = 3
+    END_OF_TRANSMISSION = 4
+upsignals = {
+    UpSignals.UPLOAD_REQUEST: b'\x01',
+    UpSignals.UPLOAD_WITH_SAVE_REQUEST: b'\x02',
+    UpSignals.CHECK_EEPROM: b'\x03',
+    UpSignals.END_OF_TRANSMISSION: b'\x04'
+}
+class DownSignals(Enum):
+    AWAITING_BYTES = 1
+    UPLOAD_COMPLETE = 2
+    FILE_TOO_BIG = 3
+    PROGRAM_READY = 4
+    NO_PROGRAM = 5
+    BAD_REQUEST = 6
+downsignals = {
+    b'\x01': DownSignals.AWAITING_BYTES,
+    b'\x02': DownSignals.UPLOAD_COMPLETE,
+    b'\x03': DownSignals.FILE_TOO_BIG,
+    b'\x04': DownSignals.PROGRAM_READY,
+    b'\x05': DownSignals.NO_PROGRAM,
+    b'\x06': DownSignals.BAD_REQUEST
+}
+
+def receive_file():
+    final = None
+    count = 0
+    while final != b'\x04':
+        if ser.in_waiting > 0:
+            count += ser.in_waiting
+            chars = ser.read(ser.in_waiting)
+            final = chars[-1:]
+            if final == b'\x04':
+                chars = chars[0:-1]
+            print(chars.decode(), flush=True, end="")
+    print("\n\t-- " + str(count) + " bytes received")
+
+if __name__ == '__main__':
+    import argparse
+    from itertools import starmap, product
+    import sys
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='A dependently typed language written for megaAVR.'
+    )
+
+    source = parser.add_argument_group("source options")
+    source.add_argument(
+        '-c', '--compile',
+        metavar="FILE",
+        help="compile to binary format",
+        type=argparse.FileType('rb', 0)
+    )
+    source.add_argument(
+        '-s', '--save',
+        action='store_true',
+        help="save binary to EEPROM"
+    )
+
+    conn = parser.add_argument_group("connection options")
+    conn.add_argument(
+        '-p', '--port',
+        help="port for communication",
+        required=True
+    )
+    conn.add_argument(
+        '-b', '--baud',
+        type=int,
+        help="baud rate, default=%(default)s",
+        default=9600
+    )
+    conn.add_argument(
+        '-f', '--frame',
+        choices=starmap("{}:{}:{}".format, product("5678", "NEO", "12")),
+        help='''serial frame format as BYTESIZE:PARITY:STOPBITS, default=8:N:1, where
+            BYTESIZE in {5, 6, 7, 8}  (9 bits not supported)
+            PARITY in {N, E, O}
+            STOPBITS in {1, 2}''',
+        default="8:N:1"
+    )
+
+    target = parser.add_argument_group("target options")
+    target.add_argument(
+        '-d', '--command',
+        choices=['elaborate', 'evaluate', 'run'],
+        help='''send command
+            elaborate: output the elaborated form
+            evaluate: output the result of evaluation
+            run: run evaluated expression as a program on chip'''
+    )
+    target.add_argument(
+        '-o', '--output',
+        type=argparse.FileType('w', encoding='UTF-8'),
+        help="write output to file"
+    )
+    target.add_argument(
+        '-r', '--pretty',
+        action='store_true',
+        help="pretty print output"
+    )
+
+    args = parser.parse_args()
+
+    # connect to serial port
+    ser = serial.Serial()
+    ser.port = args.port
+    ser.baudrate = args.baud
+    frame = args.frame.split(":")
+    ser.bytesize = frame_constants[frame[0]]
+    ser.parity = frame_constants[frame[1]]
+    ser.stopbits = frame_constants[frame[2]]
+
+    try:
+        ser.open()
+    except serial.SerialException as e:
+        sys.stderr.write("Couldn't open serial port {}:\n\t{}\n".format(ser.name, e))
+        sys.exit(1)
+    
+    if args.compile != None:
+        if args.save:
+            ser.write(upsignals[UpSignals.UPLOAD_WITH_SAVE_REQUEST])
+        else:
+            ser.write(upsignals[UpSignals.UPLOAD_REQUEST])
+        ser.flush()
+
+        # Wait for reply to upload request
+        while ser.in_waiting == 0:
+            pass
+        sig = ser.read(1)
+        match downsignals[sig]:
+            case DownSignals.AWAITING_BYTES:
+                pass
+            case DownSignals.BAD_REQUEST:
+                fail('Bad request: ' + str(sig.hex()))
+            case _:
+                fail("Expected awaiting-bytes signal, got: " + str(sig.hex()))
+
+        s = args.compile.read()
+        ser.write(s + upsignals[UpSignals.END_OF_TRANSMISSION])
+        ser.flush()
+
+        # Wait for reply to file upload
+        while ser.in_waiting == 0:
+            pass
+        sig = ser.read(1)
+        match downsignals[sig]:
+            case DownSignals.FILE_TOO_BIG:
+                fail("File size too large")
+            case DownSignals.UPLOAD_COMPLETE:
+                pass
+            case DownSignals.BAD_REQUEST:
+                fail('Bad request: ' + str(sig.hex()))
+            case _:
+                fail("Unexpected signal: " + str(sig.hex()))
+        receive_file()
+    
+    else:
+        ser.write(upsignals[UpSignals.CHECK_EEPROM])
+        ser.flush()
+
+        receive_file()
