@@ -39,6 +39,12 @@ SEI
 
 
 
+;; EEPROM
+;; Write only programming mode
+SBI 0x1F, 5
+
+
+
 ;; Await request from sandglass.py
 wait_USART0_RX_request:
 CLR r22

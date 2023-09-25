@@ -6,28 +6,30 @@ section = [section_id, section.length, payload]
 
 topname_section = section(0, [...names])     -- uint8 address space  
 locname_section = section(1, [...names])     -- uint8 enough?  
-defn_section = section(2, [...terms], term)  -- uint8 address space
+defn_section = section(2, [...terms], term)  -- paired to topnames
 
-name = [...chars]  -- how long? 64?
+name = [...chars]  -- variable length up to 64 7-bit ascii chars within 0x00-0x7F?
 
 term = [term_id, payload]
 
 loc_term = term(0, [name(uint8)])  -- local_name table  
 top_term = term(1, [name(uint8)])  -- top_name table  
 app_term = term(2, [term, term])  
-lam_term = term(3, [name, term])  
-let_term = term(4, [...name(uint8)s], [...terms], term)  
-  -- same length, locnames
+lam_term = term(3, [name(uint8), term])  -- local_name table  
+let_term = term(4, [[...name(uint8)s], [...terms], term])  
+  -- same length, local_name table
 ```
 
 ## Runtime structures
 
 ```
+topenv = [[...names], [...values]]    -- same length
+localenv = [[...names], [...values]]  -- same length
 spine = [...values]  
 value = [value_id, data]  
-lam_value = value(0, [fn(val -> val)])  
-loc_value = value(1, [name, spine])  
-top_value = value(2, [name, value, spine])
+lam_value = value(0, [name(uint8), fn(val -> val)])  
+loc_value = value(1, [name(uint8), spine])  
+top_value = value(2, [name(uint8), value, spine])
 ```
 
 ## I/O
