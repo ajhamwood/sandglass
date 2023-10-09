@@ -27,9 +27,9 @@ topenv = [[...names], [...values]]    -- same length
 localenv = [[...names], [...values]]  -- same length
 spine = [...values]  
 value = [value_id, data]  
-lam_value = value(0, [name(uint8), fn(val -> val)])  
-loc_value = value(1, [name(uint8), spine])  
-top_value = value(2, [name(uint8), value, spine])
+lam_value = value(0, [name(uint8), term, localenv])  
+loc_value = value(1, [name(uint8), spineref, spinelen])  
+top_value = value(2, [name(uint8), value, spineref, spinelen])
 ```
 
 ## I/O

@@ -1,0 +1,6 @@
+{- Comment
+  -} -- Comment
+let Eq : (A : _) -> A -> A -> U
+  = \A x y. (P : A -> U) -> P x -> P y;
+{-
+Comment -} U -- Comment

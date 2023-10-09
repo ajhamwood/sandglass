@@ -1,18 +1,24 @@
 // Adapted from https://github.com/AndrasKovacs/elaboration-zoo/blob/master/GluedEval.hs
 
 const
-    LOC = 0,
-    TOP = 1,
+    RLOC = 0,
+    RTOP = 1,
+    RAPP = 2,
+    RLAM = 3,
+    RLET = 4,
+
+    LOC = 0, // ix
+    TOP = 1, // lvl
     APP = 2,
     LAM = 3,
     LET = 4,
 
     VLAM = 0,
     VLOC = 1,
-    VTOP = 2;
+    VTOP = 2,
 
-    TopEnv = null,
-    LocEnv = [[], []];
+    NameEnv = [], //topnames ++ localnames
+    TermEnv = []; //topterms? => namenv.len >= termenv.len
 
 function term (id, payload) {
     return [id, payload]
@@ -22,15 +28,42 @@ function precParens (there, here, string) {
     return there > here ? `(${string})` : string
 }
 
-function termstr ([term_id, payload], prec = 0) {
+function rawtermstr ([rterm_id, payload], prec = 0) {
+    switch (rterm_id) {
+        case RLOC: return `RLoc ${payload[0]}`
+        case RTOP: return `RTop ${payload[0]}`
+        case RAPP: return precParens(prec, 1, `${rawtermstr(payload[0], 1)} :@: ${rawtermstr(payload[1], 2)}`)
+        case RLAM: return precParens(prec, 0, `RLam ${payload[0]}. ${rawtermstr(payload[1])}`)
+        case RLET: return payload[0].length == 1 ? rawtermstr(payload[2]) :
+            precParens(prec, 0, `RLet ${payload[0][0]} = ${rawtermstr(payload[1][0])};\n` +
+            `${rawtermstr(term(RLET, [payload[0].slice(1), payload[1].slice(1), payload[2]]))}`)
+    }
+}
+
+function lamstr (names, name, [body_tid, body_payload]) {
+    let res;
+    const ns = names.concat([name]);
+    if (body_tid !== LAM) res = `. ${termstr(ns, payload[1], 0)}`;
+    else {
+        const n = fresh(ns, body_payload[0]);
+        res = ` ${n}${lamstr(ns, n, body_payload[1])}`;
+    }
+    return res
+}
+function termstr (names, [term_id, payload], prec = 0) {
     switch (term_id) {
-        case LOC: return payload[0]
-        case TOP: return payload[0]
+        case LOC:
+            let lvl = names.length - payload[0] - 1;
+            return lvl >= names.length ? `@` + payload[0] :
+                lvl >= 0 ? names[lvl] : `#${-1 - lvl}`
+        case TOP: return NameEnv[payload[0]]
         case APP: return precParens(prec, 1, `${termstr(payload[0], 1)} ${termstr(payload[1], 2)}`)
-        case LAM: return precParens(prec, 0, `\\${payload[0]}. ${termstr(payload[1])}`)
+        case LAM:
+            let name = fresh(names, payload[0]);
+            return precParens(prec, 0, `\\${payload[0]}. ${lamstr(names, name, payload[1])}`)
         case LET: return payload[0].length == 1 ? termstr(payload[2]) :
-            precParens(prec, 0, `let ${payload[0][0]} = ${termstr(payload[1][0])};\n\
-${termstr(term(LET, [payload[0].slice(1), payload[1].slice(1), payload[2]]))}`)
+            precParens(prec, 0, `let ${payload[0][0]} = ${termstr(payload[1][0])};\n` +
+            `${termstr(term(LET, [payload[0].slice(1), payload[1].slice(1), payload[2]]))}`)
     }
 }
 
@@ -45,84 +78,50 @@ function concat ([nenv, senv], n, s) {
 function lookup (n, env) { // (value or term) | undefined
     group(() => ["lookup", n, env]);
     let result = env[1][env[0].indexOf(n)];
-    log(() => ["lookup", result]);
     ungroup();
     return result
 }
 
 function cut (mb) {
-    if (typeof mb === "undefined") throw 'Not found';
+    if (typeof mb === undefined) throw 'Not found';
     else return mb
 }
 
-function eval (topenv, [term_id, payload]) {
-    group(() => ["eval", topenv, LocEnv, term_id, payload, "\n", termstr([term_id, payload])]);
-    let result, newval;
+function eval (env, [term_id, payload]) {
+    group(() => ["eval", topenv, localenv, term_id, payload, "\n", termstr([term_id, payload])]);
+    let result;
     switch (term_id) {
-        case LOC: //payload: local_names index
-        result = cut(lookup(payload[0], LocEnv));
+        case LOC: //loc payload: debruijn index
+        result = cut(lookup(payload[0], env));
         break;
-
-        case TOP: //payload: top_names index
-        newval = cut(lookup(payload[0], topenv));
-        result = value(VTOP, [payload[0], newval, []]);
+        case TOP: //top payload: top_names level, lazy value somehow??
+        result = value(VTOP, [payload[0], cut(lookup(payload[0], env)), []]);
         break;
-
-        case APP: //payload: fn term, arg term
-        let func = eval(topenv, payload[0]),
-            arg = eval(topenv, payload[1]);
-        result = vapp(func, arg);
+        case APP: //app payload: fn term, arg term
+        result = vapp(eval(topenv, localenv, payload[0]), eval(topenv, localenv, payload[1]));
         break;
-
-        case LAM: //payload: binder name, body term, closure environment
-        result = value(VLAM, [payload[0], payload[1], [LocEnv[0].slice(), LocEnv[1].slice()]]);
+        case LAM: //lam payload: binder name, body term, closure environment
+        result = value(VLAM, [payload[0], payload[1], env.slice()]);
         break;
-
-        case LET: //payload: local names, local terms, result term
-        newval = eval(topenv, payload[1][0]);
-        let newterm;
-        if (payload[0].length == 1) newterm = payload[2]
-        else {
-            let names = payload[0].slice(1),
-                values = payload[1].slice(1);
-            newterm = term(LET, [names, values, payload[2]]);
-        }
-        LocEnv[0].push(payload[0][0])
-        LocEnv[1].push(newval)
-        result = eval(topenv, newterm);
-        LocEnv.pop()
-        LocEnv.pop()
+        case LET: //let payload: local names, local terms, result term
+        result = eval(env.concat([eval(env, payload[1])]),
+            payload[0].length == 1 ? payload[2] : term(LET, [payload[0].slice(1), payload[1].slice(1), payload[2]]))
     }
-    ungroup();
-    return result
-}
-function capp ([n, tm, localenv], val) {
-    group(() => ["capp", n, tm, localenv, val]);
-    localenv[0].push(n);
-    localenv[1].push(val);
-    let result = eval(localenv, tm);
-    localenv.pop();
-    localenv.pop();
     ungroup();
     return result
 }
 function vapp ([fn_value_id, payload], arg_value) {
     group(() => ["vapp", fn_value_id, payload, arg_value]);
-    let result, newspine;
+    let result;
     switch (fn_value_id) {
-        case VLAM: //payload: name, term, localenv
-        result = capp(payload, arg_value);
+        case VLAM: //lam payload: name, fn(val -> val)
+        result = payload[1](arg_value);
         break;
-
-        case VLOC: //payload: name, spine
-        newspine = payload[1].concat([arg_value])
-        result = value(VLOC, [payload[0], newspine]);
+        case VLOC: //loc payload: name, spine
+        result = value(VLOC, [payload[0], payload[1].concat([arg_value])]);
         break;
-
-        case VTOP: //payload: name, value, spine
-        newspine = payload[2].concat([arg_value]);
-        let newval = vapp(payload[1], arg_value);
-        result = value(VTOP, [payload[0], newval, newspine]);
+        case VTOP: //top payload: name, value, spine
+        result = value(VTOP, [payload[0], vapp(payload[1], arg_value), payload[2].concat([arg_value])])
     }
     ungroup();
     return result
@@ -134,7 +133,6 @@ function fresh (localenv, n) {
     switch(lookup(n, localenv)) {
         case undefined: result = n;
         break;
-
         default: result = fresh(localenv, n + "'")
     }
     ungroup();
@@ -143,11 +141,7 @@ function fresh (localenv, n) {
 
 function quoteSp (localenv, unfoldtop, tm, spine) {
     group(() => ["quoteSp", localenv, unfoldtop, tm, spine]);
-    let result = tm, arg;
-    for (let i = spine.length - 1; i >= 0; i--) {
-        arg = quote(localenv, unfoldtop, spine[i]);
-        result = term(APP, [result, arg])
-    }
+    let result = spine.reduceRight((acc, val) => term(APP, [acc, quote(localenv, unfoldtop, val)]), tm);
     ungroup();
     return result
 }
@@ -156,30 +150,14 @@ function quote (localenv, unfoldtop, [val_id, payload]) {
     group(() => ["quote", localenv, unfoldtop, val_id, payload]);
     let result;
     switch (val_id) {
-        case VLAM: //payload: name, term, localenv
-        let nn = fresh(localenv, payload[0]),
-            nv = value(VLOC, [nn, []]);
-        
-        payload[2][0].push(nn);
-        payload[2][1].push(nv);
-        let apcl = capp(payload[2], nn);
-        payload[2][1].pop();
-        payload[2][0].pop();
-
-        localenv[0].push(nn);
-        localenv[1].push(nv);
-        let newbody = quote(localenv, unfoldtop, apcl);
-        localenv[0].pop();
-        localenv[1].pop();
-
-        result = term(LAM, [nn, newbody]);
+        case VLAM: //lam payload: fn(val -> val)
+        let nn = fresh(localenv, payload[0]), nv = value(1, [nn, []]);
+        result = term(LAM, [nn, quote(concat(localenv, payload[0], nv), unfoldtop, payload[1](nv))]);
         break;
-
-        case VLOC: //payload: name, spine
+        case VLOC: //loc payload: name, spine
         result = quoteSp(localenv, unfoldtop, term(LOC, [payload[0]]), payload[1]);
         break;
-
-        case VTOP: //payload: name, value, spine
+        case VTOP: //top payload: name, value, spine
         result = unfoldtop ?
             quote(localenv, unfoldtop, payload[1]) :
             quoteSp(localenv, unfoldtop, term(TOP, [payload[0]]), payload[2])
@@ -189,22 +167,11 @@ function quote (localenv, unfoldtop, [val_id, payload]) {
 }
 
 function evalTop (topnames, defns, tm) {
-    TopEnv = [[], []];
-    for (let i = 0; i < topnames.length; i++) {
-        let val = eval(TopEnv, defns[i]);
-        TopEnv[0].push(topnames[i]);
-        TopEnv[1].push(val)
-    }
-    let result = eval(TopEnv, tm);
-    TopEnv = null;
-    return result
+    return eval(topnames.reduce((acc, n, i) => concat(acc, n, eval(acc, [[], []], defns[i])), [[], []]), [[], []], tm)
 }
 
 function nfTop (unfoldtop, topnames, defns, main) { //entry point
-    let finalVal = evalTop(topnames, defns, main);
-    LocEnv = [[], []];
-    let result = quote(LocEnv, unfoldtop, finalVal);
-    return result
+    return quote([[], []], unfoldtop, evalTop(topnames, defns, main))
 }
 
 let topnames = ["zero", "suc", "add", "mul", "5", "10", /*"100"*/],
@@ -232,10 +199,10 @@ let topnames = ["zero", "suc", "add", "mul", "5", "10", /*"100"*/],
     // ]);
     main = term(APP, [term(APP, [term(TOP, ["add"]), term(TOP, ["5"])]), term(TOP, ["5"])]);
 
-log = fn => console.log.apply(console, fn());
-group = fn => console.group.apply(console, fn());
-ungroup = console.groupEnd;
-// log = group = ungroup = () => {};
+    log = fn => console.log.apply(console, fn());
+    group = fn => console.group.apply(console, fn());
+    ungroup = console.groupEnd;
+    // log = group = ungroup = () => {};
 
 console.log("glued: ", termstr(nfTop(false, topnames, defns, main)));
 console.log("unglued: ", termstr(nfTop(true, topnames, defns, main)))

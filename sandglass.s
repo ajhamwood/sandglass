@@ -46,8 +46,8 @@ SBI 0x1F, 5
 
 
 ;; Await request from sandglass.py
-wait_USART0_RX_request:
 CLR r22
+wait_USART0_RX_request:
 
 LDS r16, 0xC0
 SBRS r16, 7
@@ -57,9 +57,10 @@ LDS r16, 0xC6
 LDI r17, 0x03
 CP r16, r17
 BRLT upload_request
-CP r16, r17
 BREQ load_eeprom_request
-RJMP wait_USART0_RX_request
+LDI r17, 0x04
+CP r16, r17
+BREQ wait_USART0_RX_request
 RJMP bad_request
 
 
