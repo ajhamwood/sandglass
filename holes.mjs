@@ -9,7 +9,7 @@
 
 import { dedent } from "./utils.mjs";
 import { Result, Parser } from "./parser.mjs"
-
+const colours = [37, 94, 32, 33, 36, 31, 93, 96, 95]
 
 // AST
 const
@@ -458,48 +458,591 @@ export function rawtermstr (rterm, colours) {
 }
 
 
-
-// Evaluation: low level sketch
-class EvaluateHoles {
-  #metas
-  #source
-  infer = () => {
-    return Result.pure({ term: "Hi" })
-  }
-  quote = () => {}
-  eval = () => {}
-  doElab = ({ data: rterm }) => {
-    this.reset();
-    return this.infer({ ctx: { env: [], names: new Map(), bds: [], lvl: 0 }, rterm })
-      .catch(this.displayError)
-  }
-  returnAll = ({ ctx, term, vtype }) => ({
-    term: this.quote({ ctx, lvl: 0, val: this.eval({ ctx, term, env: [] }) }),
-    type: this.quote({ ctx, lvl: 0, val: vtype }),
-    elab: term,
-    metas: Array.from(this.#metas).map(([ mvar, soln ]) =>
-      new metaentry([mvar, soln === null ? soln : this.quote({ ctx, lvl: 0, val: soln })]))
-  })
-
-  constructor (state) {
-    let i = 0;
-    this.nextMetaVar = () => i++;
-    this.reset = () => {
-      this.#metas = new Map();
-      this.#source = state.source;
-      i = 0
+export function termstr ([term_id, payload], names = [], prec = 0) {
+  const
+    fresh = (names, name) => name === "_" ? "_" : names.reduce((acc, n) => new RegExp(`^${acc}[']*$`).test(n) ? n + "'" : acc, name),
+    precParens = (there, here, string) => there > here ? `(${string})` : string,
+    lamstr = (names, name, [body_tid, body_payload]) => {
+      let res;
+      const ns = names.concat([name]);
+      if (body_tid !== LAM) res = `. ${termstr([body_tid, body_payload], ns, 0)}`;
+      else {
+        const n = fresh(ns, body_payload[0]);
+        res = ` ${n}${lamstr(ns, n, body_payload[1])}`;
+      }
+      return res
+    },
+    pibind = (names, name, dom) => `(${name} : ${termstr(dom, names, 0)})`,
+    pistr = (names, name, [cod_tid, cod_payload]) => {
+      let res;
+      const ns = names.concat([name]);
+      if (cod_tid !== PI) res = ` -> ${termstr([cod_tid, cod_payload], ns, 1)}`;
+      else if (cod_payload[0] === "_") res = ` -> ${termstr(cod_payload[1], ns, 2)} -> ${termstr(cod_payload[2], ns.concat(["_"]), 1)}`;
+      else {
+        const n = fresh(ns, cod_payload[0]);
+        res = pibind(ns, n, cod_payload[1]) + pistr(ns, n, cod_payload[2])
+      }
+      return res
     };
-    this.run = () => this.doElab(state)
-      .then(this.returnAll)
+  let str, name;
+  switch (term_id) {
+    case VAR:
+      let lvl = names.length - payload[0] - 1;
+      return lvl >= names.length ? `@` + payload[0] :
+        lvl >= 0 ? names[lvl] : `#${-1 - lvl}`
+    case APP: return precParens(prec, 2, `${termstr(payload[0], names, 2)} ${termstr(payload[1], names, 3)}`)
+    case LAM:
+      name = fresh(names, payload[0]);
+      return precParens(prec, 0, `\\${name}${lamstr(names, name, payload[1])}`)
+    case PI:
+      name = fresh(names, payload[0]);
+      str = name === "_" ? `${termstr(payload[1], names, 2)} -> ${termstr(payload[2], names.concat(["_"]), 1)}` :
+        pibind(names, name, payload[1]) + pistr(names, name, payload[2]);
+      return precParens(prec, 1, str)
+    case U:
+      return "U"
+    case LET:
+      let ns = names.slice();
+      str = "";
+      for (let i = 0; i < payload[0].length; i++) {
+        name = fresh(ns, payload[0]);
+        str += `let ${payload[0][i]} : ${termstr(payload[1][i], ns)}\n\t= ${termstr(payload[2][i], ns)};\n`;
+        ns = ns.concat([payload[0][i]]);
+      }
+      return precParens(prec, 0, str + termstr(payload[3], ns))
+    case META:
+      return `?${payload[0]}`
+    case IMETA:
+      str = `?${payload[0]}${names.filter(({}, i) => payload[1][i]).map(n => ` ${n}`).join("")}`;
+      return precParens(prec, 2, str)
   }
 }
 
-function metaentry([mvar, soln]) {  // Is mvar redundant here?
+export function metastr (mvar, soln) {
+  return `let ?${mvar} = ${soln === null ? "?" : termstr(soln)};\n`
+}
+
+
+
+// Evaluation: low level sketch
+class EvaluateHoles {
+  #metas  // [int mvar, term soln][]
+  #source
+  #mvar
+
+  eval = ([term_id, payload], env, ctx) => {
+    let result;
+    switch (term_id) {
+      case VAR:
+        result = env[env.length - payload[0] - 1]
+        break;
+      case LAM:  // str name, term clsTerm, value[] clsEnv
+        result = value(VLAM, [payload[0], payload[1], env])
+        break;
+      case APP:
+        const func = this.eval(payload[0], env, ctx),
+              arg = this.eval(payload[1], env, ctx);
+        result = this.vApp(func, arg, ctx);
+        break;
+      case U:
+        result = value(VU, []);
+        break;
+      case PI:  // str name, value domain, value codomain
+        const dom = this.eval(payload[1], env, ctx);
+        result = value(VPI, [payload[0], dom, payload[2], env]);
+        break;
+      case LET:
+        let newVal, newEnv = env.slice();
+        for (let i = 0; i < payload[2].length; i++) {
+          newVal = this.eval(payload[2][i], env, ctx);
+          newEnv.push(newVal);
+        }
+        result = this.eval(payload[3], newEnv, ctx);
+        break;
+      case META:
+        result = this.vMeta(payload[0]);
+        break;
+      case IMETA:
+        const meta = this.vMeta(payload[0])
+        result = this.vAppBDs(meta, env, payload[1], ctx)
+        break;
+    }
+    return result
+  }
+  cApp = (val, term, env, ctx) => {
+    const newEnv = structuredClone(env).concat([val]);
+    return this.eval(term, newEnv, ctx)
+  }
+  vApp = ([vfunc_id, payload], varg, ctx) => {
+    let result, newSpine;
+    switch (vfunc_id) {
+      case VLAM:
+        result = this.cApp(varg, payload[1], payload[2], ctx);
+        break;
+      case VFLEX:  // int mvar, value[] spine
+        newSpine = structuredClone(payload[1]).concat([ varg ]);
+        result = value(VFLEX, [payload[0], newSpine]);
+        break;
+      case VRIGID:  // int lvl, value[] spine
+        newSpine = structuredClone(payload[1]).concat([ varg ]);
+        result = value(VRIGID, [payload[0], newSpine]);
+        break;
+    }
+    return result
+  }
+  vAppSp = (val, spine, ctx) => {
+    let result = val;
+    for (let i = 0; i < spine.length; i++)
+      result = this.vApp(result, spine[i], ctx);
+    return result
+  }
+  vMeta = mvar => {
+    const [, soln] = this.#metas.find(([m]) => m === mvar);
+    return soln === null ? value(VFLEX, [mvar, []]) : soln
+  }
+  vAppBDs = (val, env, bds, ctx) => {
+    let result = val;
+    for (let i = 0; i < bds.length; i++)
+      result = bds[i] ? this.vApp(result, env[i], ctx) : result;
+    return result
+  }
+
+  quote = ([val_id, payload], lvl, ctx) => {
+    let result, newTerm, newVal, freshVal;
+    switch (val_id) {
+      case VFLEX:
+        newTerm = term(META, [payload[0]]);
+        result = this.quoteSp(newTerm, payload[1], lvl, ctx);
+        break;
+      case VRIGID:
+        newTerm = term(VAR, [lvl - payload[0] - 1]);
+        result = this.quoteSp(newTerm, payload[1], lvl, ctx);
+        break;
+      case VLAM:
+        freshVal = value(VRIGID, [lvl, []]);
+        newVal = this.cApp(freshVal, payload[1], payload[2], ctx);
+        newTerm = this.quote(newVal, lvl + 1, ctx);
+        result = term(LAM, [payload[0], newTerm]);
+        break;
+      case VPI:
+        freshVal = value(VRIGID, [lvl, []]);
+        newVal = this.cApp(freshVal, payload[2], payload[3]);
+        newTerm = this.quote(newVal, lvl + 1, ctx);
+        const newDom = this.quote(payload[1], lvl, ctx);
+        result = term(PI, [payload[0], newDom, newTerm])
+        break;
+      case VU:
+        result = term(U, []);
+        break;
+    }
+    return result
+  }
+  quoteSp = (tm, spine, lvl, ctx) => {
+    let result = tm;
+    for (let i = 0; i < spine.length; i++) {
+      let arg = this.quote(spine[i], lvl, ctx);
+      result = term(APP, [result, arg]);
+    }
+    return result
+  }
+  force = ([val_id, payload], ctx) => {
+    if (val_id !== VFLEX) return [val_id, payload];
+    const [, soln] = this.#metas.find(([m]) => m == payload[0]);
+    if (soln === null) return [val_id, payload];
+    const newVal = this.vAppSp(soln, payload[1], ctx);
+    return this.force(newVal, ctx)
+  }
+
+  nextMetaVar = () => this.#mvar++;
+  reset = () => {
+    this.#metas = [];
+    this.#mvar = 0
+  }
+  freshMeta = ([lvl, env, names, types, bds]) => {
+    const mvar = this.nextMetaVar();
+    this.#metas.push([mvar, null]);
+    return term(IMETA, [mvar, bds])
+  }
+
+  bind = (vtype, name, [lvl, env, names, vtypes, bds]) => {
+    const freshVal = value(VRIGID, [lvl, []]),
+          newEnv = structuredClone(env).concat([freshVal]),
+          newNames = names.concat([name]),
+          newTypes = structuredClone(vtypes).concat([vtype]),
+          newBDs = bds.concat([true]);
+    return [lvl + 1, newEnv, newNames, newTypes, newBDs]
+  }
+  define = (val, vtype, name, [lvl, env, names, vtypes, bds]) => {
+    const newEnv = structuredClone(env).concat([val]),
+          newNames = names.concat([name]),
+          newTypes = structuredClone(vtypes).concat([vtype]),
+          newBDs = bds.concat([false]);
+    return [lvl + 1, newEnv, newNames, newTypes, newBDs]
+  }
+
+  liftPRen = ([occ, dom, cod, ren]) => {
+    const newRen = structuredClone(ren),
+          i = newRen.findIndex(([c]) => c === cod);
+    if (~i) newRen[i][1] = dom;
+    else newRen.push([cod, dom]);
+    return [occ, dom + 1, cod + 1, newRen]
+  }
+  invertPRen = (spine, lvl, ctx) => {
+    let dom = 0, ren = [];
+    for (let i = 0; i < spine.length; i++) {
+      const [fval_id, payload] = this.force(spine[i], ctx);
+      if (fval_id === VRIGID && payload[1].length === 0) {
+        const i = ren.findIndex(([c]) => c === payload[0]);
+        if (!~i) {
+          ren.push([i, dom]);
+          dom++;
+          continue
+        }
+      } // TODO: use error codes
+      return [1, "Unification error: Must substitute on unblocked variable"];
+    }
+    return [0, [null, dom, lvl, ren]]
+  }
+  rename = (val, pren, ctx) => {
+    const [fval_id, payload] = this.force(val, ctx),
+          [occ, dom, cod, ren] = pren;
+    let err = 0, result, i, newTerm, newPren, freshVal, newDom;
+    switch (fval_id) {
+      case VFLEX:
+        if (occ === payload[0]) return [1, "Unification error: occurs check"];
+        result = term(META, [payload[0]]);
+        for (let i = 0; i < payload[1].length; i++) {
+          ([err, newTerm] = this.rename(payload[1][i], pren, ctx));
+          if (err) {
+            result = newTerm;
+            break
+          }
+          result = term(APP, [result, newTerm])
+        }
+        break;
+      case VRIGID:
+        i = ren.findIndex(([c]) => c === payload[0]);
+        if (!~i) return [1, "Unification error: variable escapes scope"];
+        result = term(VAR, [dom - ren[i] - 1]);
+        for (let i = 0; i < payload[1].length; i++) {
+          ([err, newTerm]  = this.rename(payload[1][i], pren, ctx));
+          if (err) {
+            result = newTerm;
+            break
+          }
+          result = term(APP, [result, newTerm])
+        }
+        break;
+      case VLAM:
+        newPren = this.liftPRen(pren);
+        freshVal = value(VRIGID, [cod, []]);
+        newVal = this.cApp(freshVal, payload[1], payload[2], ctx);
+        ([err, newTerm] = this.rename(newVal, newPren, ctx));
+        if (err) {
+          result = newTerm;
+          break
+        }
+        result = term(LAM, [payload[0], newTerm]);
+        break;
+      case VPI:
+        ([err, newDom] = this.rename(payload[1], pren, ctx));
+        if (err) {
+          result = newDom;
+          break
+        }
+        newPren = this.liftPRen(pren);
+        freshVal = value(VRIGID, [cod, []]);
+        newVal = this.cApp(freshVal, payload[1], payload[2], ctx);
+        ([err, newTerm] = this.rename(newVal, newPren, ctx));
+        if (err) {
+          result = newTerm;
+          break
+        }
+        result = term(PI, [payload[0], newDom, newTerm]);
+        break;
+      case VU:
+        result = term(U, []);
+        break;
+    }
+    return [err, result]
+  }
+
+  solve = (val, spine, lvl, mvar, ctx) => {
+    let err, newPren, result, i;
+    ([err, newPren] = this.invertPRen(spine, lvl, ctx));
+    if (err) return [1, newPren];
+    newPren[0] = mvar;
+    ([err, result] = this.rename(val, newPren, ctx));
+    if (err) return [1, result];
+    for (let i = newPren[1]; i > 0; i--)
+      result = term(LAM, ["x" + i, result]);
+    result = this.eval(result, [], ctx);
+    i = this.#metas.findIndex(([m]) => m === mvar);
+    if (~i) this.#metas[i][1] = result;
+    else this.#metas.push([mvar, result]);
+    return [0]
+  }
+  unify = (val0, val1, lvl, ctx) => {
+    const [fval0_id, payload0] = this.force(val0, ctx),
+          [fval1_id, payload1] = this.force(val1, ctx);
+    let err, result;
+    if (fval0_id === VU && fval1_id === VU) err = 0;
+    else if (fval0_id === VPI && fval1_id === VPI) {
+      ([err, result] = this.unify(payload0[1], payload1[1], lvl, ctx));
+      if (!err) {
+        const freshVal0 = value(VRIGID, [lvl, []]),
+              val0 = this.cApp(freshVal0, payload0[2], payload0[3], ctx),
+              freshVal1 = value(VRIGID, [lvl, []]),
+              val1 = this.cApp(freshVal1, payload1[2], payload1[3], ctx);
+        ([err, result] = this.unify(val0, val1, lvl + 1, ctx))
+      }
+    }
+    else if (fval0_id === VRIGID && fval1_id === VRIGID && payload0[0] === payload1[0])
+      ([err, result] = this.unifySp(payload0[1], payload1[1], lvl));
+    else if (fval0_id === VFLEX && fval1_id === VFLEX && payload0[0] === payload1[0])
+      ([err, result] = this.unifySp(payload0[1], payload1[1], lvl));
+    else if (fval0_id === VLAM && fval1_id === VLAM) {
+      const freshVal0 = value(VRIGID, [lvl, []]),
+            val0 = this.cApp(freshVal0, payload0[1], payload0[2], ctx),
+            freshVal1 = value(VRIGID, [lvl, []]),
+            val1 = this.cApp(freshVal1, payload1[1], payload1[2], ctx);
+      ([err, result] = this.unify(val0, val1, lvl + 1, ctx))
+    } else if (fval0_id === VLAM) {
+      const freshVal0 = value(VRIGID, [lvl, []]),
+            val0 = this.cApp(freshVal0, payload0[1], payload0[2], ctx),
+            freshVal1 = value(VRIGID, [lvl, []]),
+            val1 = this.vApp([fval1_id, payload1], freshVal1, ctx);
+      ([err, result] = this.unify(val0, val1, lvl + 1, ctx))
+    }
+    else if (fval1_id === VLAM) {
+      const freshVal0 = value(VRIGID, [lvl, []]),
+            val0 = this.vApp([fval0_id, payload0], freshVal0, ctx),
+            freshVal1 = value(VRIGID, [lvl, []]),
+            val1 = this.cApp(freshVal1, payload1[1], payload1[2], ctx);
+      ([err, result] = this.unify(val0, val1, lvl + 1, ctx))
+    }
+    else if (fval0_id === VFLEX)
+      ([err, result] = this.solve([fval1_id, payload1], payload0[1], lvl, payload0[0], ctx))
+    else if (fval1_id === VFLEX)
+      ([err, result] = this.solve([fval0_id, payload0], payload1[1], lvl, payload1[0], ctx))
+    else ([err, result] = [1, "Unification error: rigid mismatch"]);
+    return [err, result]
+  }
+  unifySp = (sp0, sp1, lvl) => {
+    if (sp0.length !== sp1.length) return [1, "Unification error: rigid mismatch"];
+    for (let i = 0; i < sp0.length; i++) {
+      const [err, msg] = this.unify(sp0[i], sp1[i], lvl, ctx);
+      if (err) return [1, msg]
+    }
+    return [0]
+  }
+  unifyCatch = (val0, val1, [lvl, env, names, vtypes, bds]) => {
+    const ctx = [lvl, env, names, vtypes, bds],
+          [err, msg] = this.unify(val0, val1, lvl, ctx);
+    if (err) {
+      const term0 = this.quote(val0, lvl, ctx),
+            term1 = this.quote(val1, lvl, ctx);
+      return [1, `${msg}\nCan't unify\n\t${termstr(term0, names)}\nwith\n\t${termstr(term1, names)}`]
+    } else return [0]
+  }
+
+  check = (rterm, vtype, ctx) => {
+    const [rterm_id, payloadr] = rterm,
+          [lvl, env, names, vtypes, bds] = ctx,
+          [fvtype_id, payloadfv] = this.force(vtype, ctx);
+    let err, result;
+    if (rterm_id === RLAM && fvtype_id === VPI) {
+      const newCtx = this.bind(payloadfv[1], payloadr[0], ctx),
+            freshVal = value(VRIGID, [lvl, []]),
+            newVal = this.cApp(freshVal, payloadfv[2], payloadfv[3], newCtx);
+      ([err, result] = this.check(payloadr[1], newVal, newCtx));
+      if (!err) result = term(LAM, [payloadr[0], result])
+    }
+    else if (rterm_id === RLET) {
+      const lnames = [], types = [], terms = [], newCtx = ctx;
+      for (let i = 0; i < payloadr[0].length; i++) {
+        lnames.push(payloadr[0][i]);
+        const uVal = value(VU, []);
+        let type, tm;
+        ([err, type] = this.check(payloadr[1][i], uVal, newCtx));
+        if (err) {
+          result = type;
+          break
+        }
+        types.push(type);
+        const cvtype = this.eval(type, env, newCtx);
+        ([err, tm] = this.check(payloadr[2][i], cvtype, newCtx));
+        if (err) {
+          result = tm;
+          break
+        }
+        terms.push(tm);
+        const newVal = this.eval(tm, env, newCtx);
+        newCtx = this.define(newVal, cvtype, payloadr[0][i], newCtx);
+      }
+      if (!err) {
+        ([err, result] = this.check(payloadr[3], [fvtype_id, payloadfv], newCtx));
+        if (!err) result = term(LET, [lnames, types, terms, result])
+      }
+    }
+    else if (rterm_id === RHOLE) ([err, result] = [0, this.freshMeta(ctx)]);
+    else {
+      ([err, result] = this.infer(rterm, ctx));
+      if (!err) {
+        const [ivtype, tm] = result;
+        ([err, result] = this.unifyCatch([fvtype_id, payloadfv], ivtype, ctx));
+        if (!err) result = tm
+      }
+    };
+    return [err, result]
+  }
+  infer = ([rterm_id, payloadr], ctx) => {
+    let err, result, vtype, dom, newCtx, newVal, tm;
+    const [lvl, env, names, vtypes, bds] = ctx,
+          uVal = value(VU, []);
+    switch (rterm_id) {
+      case RVAR:
+        const i = names.findLastIndex(n => n === payloadr[0]);
+        err = ~i ? 0 : 1;
+        if (~i) {
+          tm = term(VAR, [lvl - i - 1]);
+          result = [vtypes[i], tm]
+        } else result = `Evaluator error: name not in scope "${payloadr[0]}"`
+        break;
+      case RLAM:
+        const newMeta = this.freshMeta(ctx);
+        vtype = this.eval(newMeta, env, ctx);
+        newCtx = this.bind(vtype, payloadr[0], ctx);
+        ([err, result] = this.infer(payloadr[1], newCtx));
+        if (err) break;
+        const [ivtype, body] = result,
+              clsTerm = this.quote(ivtype, lvl + 1, ctx);
+        tm = term(LAM, [payloadr[0], body]);
+        vtype = value(VPI, [payloadr[0], vtype, clsTerm, env]);
+        result = [vtype, tm];
+        break;
+      case RAPP:
+        ([err, result] = this.infer(payloadr[0], ctx));
+        if (err) break;
+        [vtype, tm] = result;
+        const [fvtype_id, payloadfv] = this.force(vtype, ctx);
+        let clsTm, clsEnv;
+        if (fvtype_id === VPI) {
+          dom = payloadfv[1]
+          clsTm = payloadfv[2]
+          clsEnv = payloadfv[3];
+        } else {
+          const newMeta = this.freshMeta(ctx);
+          dom = this.eval(newMeta, env, ctx);
+          newCtx = this.bind(dom, "x", ctx);
+          clsTm = this.freshMeta(newCtx);
+          clsEnv = env;
+          const newVal = value(VPI, ["x", dom, clsTm, env]);
+          ([err, result] = this.unifyCatch(newVal, vtype, ctx));
+          if (err) break
+        }
+        ([err, result] = this.check(payloadr[1], dom, ctx));
+        if (err) break;
+        newVal = this.eval(result, env, ctx);
+        vtype = this.cApp(newVal, clsTm, clsEnv, ctx);
+        tm = term(APP, [tm, result]);
+        result = [vtype, tm];
+        break;
+      case RU:
+        tm = term(U, []);
+        result = [uVal, tm];
+        break;
+      case RPI:
+        ([err, result] = this.check(payloadr[1], uVal, ctx));
+        if (err) break;
+        dom = result;
+        vtype = this.eval(result, env, ctx);
+        newCtx = this.bind(vtype, payloadr[0], ctx);
+        ([err, result] = this.check(payloadr[2], uVal, newCtx));
+        if (err) break;
+        vtype = uVal;
+        tm = term(PI, [payloadr[0], dom, result]);
+        result = [vtype, tm];
+        break;
+      case RLET:
+        newCtx = ctx;
+        const lnames = [], types = [], terms = [];
+        for (let i = 0; i < payloadr[0].length; i++) {
+          lnames.push(payloadr[0][i]);
+          ([err, result] = this.check(payloadr[1][i], uVal, newCtx));
+          if (err) break;
+          types.push(result);
+          const type = result,
+                cvtype = this.eval(type, newCtx[1], newCtx);
+          ([err, result] = this.check(payloadr[2][i], cvtype, newCtx));
+          if (err) break;
+          tm = result;
+          terms.push(tm);
+          newVal = this.eval(tm, newCtx[1], newCtx);
+          newCtx = this.define(newVal, cvtype, payloadr[0][i], newCtx);
+        }
+        if (err) break;
+        ([err, result] = this.infer(payloadr[3], newCtx));
+        if (err) break;
+        ([vtype, tm] = result);
+        tm = term(LET, [lnames, types, terms, tm]);
+        result = [vtype, tm];
+        break;
+      case RHOLE:
+        const vMeta = this.freshMeta(ctx);
+        vtype = this.eval(vMeta, env, ctx);
+        tm = this.freshMeta(ctx);
+        result = [vtype, tm];
+        break;
+    }
+    return [err, result]
+  }
+
+  doElab = ({ data: rterm }) => {
+    this.reset();
+    // local context: [int lvl, value[] env, str[] names, value[] vtypes, bool[] bds]
+    const [err, result] = this.infer(rterm, [0, [], [], [], []]);
+    if (err) return [err, this.displayError(result)];
+    else return [err, result]
+  }
+  returnAll = ([vtype, term]) => {
+    const ctx = [0, [], [], [], []],
+          finalVal = this.eval(term, [], ctx),
+          finalTerm = this.quote(finalVal, 0, ctx),
+          finalType = this.quote(vtype, 0, ctx),
+          metaCtx = [];
+    for (let i = 0; i < this.#metas.length; i++) {
+      let [mvar, soln] = this.#metas[i];
+      if (soln !== null) soln = this.quote(soln, 0, ctx);
+      const entry = metaentry(mvar, soln);
+      metaCtx.push(entry)
+    }
+    return [ finalTerm, finalType, term, metaCtx ]  // [ term, type, elab, metas ]
+  }
+  displayError = errmsg => errmsg
+
+  constructor (state) {
+    this.#source = state.source;
+    this.run = () => {
+      const [err, result] = this.doElab(state);
+      if (err) return [err, result];
+      else return [err, this.returnAll(result)]
+    }
+  }
+}
+
+function value (id, payload) {
+  return [id, structuredClone(payload)]
+}
+
+function term (id, payload) {
+  return [id, structuredClone(payload)]
+}
+
+function metaentry(mvar, soln) {  // Is mvar redundant here?
   return [mvar, soln]
 }
 
 export async function evaluate(state) {
-  return new EvaluateHoles(state)
-    .run()
-    .toPromise()
+  return new EvaluateHoles(state).run()
 }

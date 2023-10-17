@@ -1,6 +1,10 @@
-{- Comment
-  -} -- Comment
-let Eq : (A : _) -> A -> A -> U
-  = \A x y. (P : A -> U) -> P x -> P y;
-{-
-Comment -} U -- Comment
+let List : U -> U
+  = \A. (L : _) -> (A -> L -> L) -> L -> L;
+
+let nil : (A : _) -> List A
+  = \A L cons nil. nil;
+
+let cons : (A : _) -> A -> List A -> List A
+  = \A x xs L cons nil. cons x (xs _ cons nil);
+
+U
