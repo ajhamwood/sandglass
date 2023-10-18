@@ -662,22 +662,22 @@ class EvaluateHoles {
 
   bind = (vtype, name, [lvl, env, names, vtypes, bds]) => {
     const freshVal = value(VRIGID, [lvl, []]),
-          newEnv = structuredClone(env).concat([freshVal]),
+          newEnv = env.concat([freshVal]),
           newNames = names.concat([name]),
-          newTypes = structuredClone(vtypes).concat([vtype]),
+          newTypes = vtypes.concat([vtype]),
           newBDs = bds.concat([true]);
     return [lvl + 1, newEnv, newNames, newTypes, newBDs]
   }
   define = (val, vtype, name, [lvl, env, names, vtypes, bds]) => {
-    const newEnv = structuredClone(env).concat([val]),
+    const newEnv = env.concat([val]),
           newNames = names.concat([name]),
-          newTypes = structuredClone(vtypes).concat([vtype]),
+          newTypes = vtypes.concat([vtype]),
           newBDs = bds.concat([false]);
     return [lvl + 1, newEnv, newNames, newTypes, newBDs]
   }
 
   liftPRen = ([occ, dom, cod, ren]) => {
-    const newRen = structuredClone(ren),
+    const newRen = ren,
           i = newRen.findIndex(([c]) => c === cod);
     if (~i) newRen[i][1] = dom;
     else newRen.push([cod, dom]);
@@ -956,9 +956,8 @@ class EvaluateHoles {
                 cvtype = this.eval(type, newCtx[1], newCtx);
           ([err, result] = this.check(payloadr[2][i], cvtype, newCtx));
           if (err) break;
-          tm = result;
-          terms.push(tm);
-          newVal = this.eval(tm, newCtx[1], newCtx);
+          terms.push(result);
+          newVal = this.eval(result, newCtx[1], newCtx);
           newCtx = this.define(newVal, cvtype, payloadr[0][i], newCtx);
         }
         if (err) break;
@@ -992,7 +991,7 @@ class EvaluateHoles {
           metaCtx = [];
     for (let i = 0; i < this.#metas.length; i++) {
       let [mvar, soln] = this.#metas[i];
-      if (soln !== null) soln = this.quote(soln, 0, ctx.slice());
+      if (soln !== null) soln = this.quote(soln, 0, ctx);
       const entry = metaentry(mvar, soln);
       metaCtx.push(entry)
     }
@@ -1011,11 +1010,11 @@ class EvaluateHoles {
 }
 
 function value (id, payload) {
-  return [id, structuredClone(payload)]
+  return [id, payload]
 }
 
 function term (id, payload) {
-  return [id, structuredClone(payload)]
+  return [id, payload]
 }
 
 function metaentry(mvar, soln) {  // Is mvar redundant here?
