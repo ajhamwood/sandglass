@@ -14,11 +14,11 @@ const fs = require("node:fs/promises");
 
     ([evalErr, result] = await evaluate(parsed));
     if (evalErr) console.log("Error:", `\n\t${result}`);
-    else console.log("Result:", `\n\tTerm: ${
-      termstr(result[0])}\n\tType: ${
-      termstr(result[1])}\n\tElab:\n${
-      termstr(result[2])}\n\tMetas:\n${
-      result[3].map(([mvar, soln]) => metastr(mvar, soln)).join("")}`)
+    else console.log("Result:",
+      `\n\tTerm: ${termstr(result[0])
+      }\n\tType: ${termstr(result[1])
+      }\n\tElab:\n${termstr(result[2])
+      }\n\tMetas:\n${metastr(result[3])}`)
 
   } catch (e) {
     if (e.message) console.error(e.message);

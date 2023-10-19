@@ -45,4 +45,4 @@ let nine : Nat = mul three three;
 
 let eqTest : Eq _ nine nine = refl _ _;
 
-U
+nil _

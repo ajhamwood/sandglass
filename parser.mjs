@@ -6,10 +6,9 @@ export class Result {
       error = v => (thrown = true, v),
       join = (fn, v = value) => {
         value = fn(v, error);
-        if (Result.prototype.isPrototypeOf(value)) {
-          const r = value.unwrap();
-          value = "ok" in r ? r.ok : error(r.err)
-        }
+        if (!Result.prototype.isPrototypeOf(value)) return;
+        const r = value.unwrap();
+        value = "ok" in r ? r.ok : error(r.err)
       };
 
     // On resolve
@@ -99,7 +98,7 @@ export class Parser {
     this.#pos = [start.slice(), end.slice()];
     return [start, end]
   }
-  getPos = () => structuredClone(this.#pos)
+  getPos = () => this.#pos
 
   // Parser state functions
   any = ({ source, region: { label, labelling }, offset, pos: [row, col], data }) =>

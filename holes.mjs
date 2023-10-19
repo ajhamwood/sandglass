@@ -34,7 +34,7 @@ const
     PI     = 4, // str name, term domain, term codomain
     LET    = 5, // str[] names, term[] types, term[] terms, term result
     META   = 6, // int mvar
-    IMETA  = 7; // int mvar, bool[] binder_or_definitions
+    IMETA  = 7; // int mvar, bool[] is_defns
 
 
 // Source string region labels
@@ -456,7 +456,6 @@ export function rawtermstr (rterm, colours) {
   return rawstr(rterm, 0) + "\x1b[0m"
 }
 
-
 export function termstr ([term_id, payload], names = [], prec = 0) {
   const
     fresh = (names, name) => name === "_" ? "_" : names.reduce((acc, n) => new RegExp(`^${acc}[']*$`).test(n) ? n + "'" : acc, name),
@@ -512,22 +511,31 @@ export function termstr ([term_id, payload], names = [], prec = 0) {
     case META:
       return `?${payload[0]}`
     case IMETA:
-      str = `?${payload[0]}${names.filter(({}, i) => payload[1][i]).map(n => ` ${n}`).join("")}`;
-      return precParens(prec, 2, str)
+      const spinestr = names.filter(({}, i) => payload[1][i]).map(n => ` ${n}`).join("");
+      str = `?${payload[0]}${spinestr}`;
+      return spinestr.length === 0 ? str : precParens(prec, 2, str)
   }
 }
 
-export function metastr (mvar, soln) {
-  return `let ?${mvar} = ${soln === null ? "?" : termstr(soln)};\n`
+export function metastr (metactx) {
+  return metactx.map((soln, mvar) => `let ?${mvar} = ${soln === null ? "?" : termstr(soln)};`).join("\n")
 }
 
+
+// Error codes
+const
+  VARBLOCKED_ERR = 0,
+  OCCURS_ERR = 1,
+  ESCAPESCOPE_ERR = 2,
+  RIGIDMISMATCH_ERR = 3,
+  UNIFY_COMBINING_ERR = 4,
+  UNSCOPEDNAME_ERR = 5;
 
 
 // Evaluation: low level sketch
 class EvaluateHoles {
   #metas    // [int mvar, term soln][]
   #source   // str source
-  #nextMeta // int nextMeta
 
   eval = ([term_id, payload], env, ctx) => {
     let result;
@@ -547,13 +555,13 @@ class EvaluateHoles {
         result = value(VU, []);
         break;
       case PI:
-        const dom = this.eval(payload[1], env, ctx);
-        result = value(VPI, [payload[0], dom, payload[2], env]);
+        const domVal = this.eval(payload[1], env, ctx);
+        result = value(VPI, [payload[0], domVal, payload[2], env]);
         break;
       case LET:
-        let newVal, newEnv = env.slice();
+        const newEnv = env.slice();
         for (let i = 0; i < payload[2].length; i++) {
-          newVal = this.eval(payload[2][i], newEnv, ctx);
+          const newVal = this.eval(payload[2][i], newEnv, ctx);
           newEnv.push(newVal);
         }
         result = this.eval(payload[3], newEnv, ctx);
@@ -594,7 +602,7 @@ class EvaluateHoles {
     return result
   }
   vMeta = mvar => {
-    const [, soln] = this.#metas.find(([m]) => m === mvar);
+    const soln = this.#metas[mvar];
     return soln === null ? value(VFLEX, [mvar, []]) : soln
   }
   vAppBDs = (val, env, bds, ctx) => {
@@ -605,7 +613,7 @@ class EvaluateHoles {
   }
 
   quote = ([val_id, payload], lvl, ctx) => {
-    let result, newTerm, newVal, freshVal;
+    let result, newTerm, newVal;
     switch (val_id) {
       case VFLEX:
         newTerm = term(META, [payload[0]]);
@@ -616,14 +624,12 @@ class EvaluateHoles {
         result = this.quoteSp(newTerm, payload[1], lvl, ctx);
         break;
       case VLAM:
-        freshVal = value(VRIGID, [lvl, []]);
-        newVal = this.cApp(freshVal, payload[1], payload[2], ctx);
+        newVal = this.cApp(freshVal(lvl), payload[1], payload[2], ctx);
         newTerm = this.quote(newVal, lvl + 1, ctx);
         result = term(LAM, [payload[0], newTerm]);
         break;
       case VPI:
-        freshVal = value(VRIGID, [lvl, []]);
-        newVal = this.cApp(freshVal, payload[2], payload[3]);
+        newVal = this.cApp(freshVal(lvl), payload[2], payload[3]);
         newTerm = this.quote(newVal, lvl + 1, ctx);
         const newDom = this.quote(payload[1], lvl, ctx);
         result = term(PI, [payload[0], newDom, newTerm])
@@ -636,33 +642,28 @@ class EvaluateHoles {
   quoteSp = (tm, spine, lvl, ctx) => {
     let result = tm;
     for (let i = 0; i < spine.length; i++) {
-      let arg = this.quote(spine[i], lvl, ctx);
+      const arg = this.quote(spine[i], lvl, ctx);
       result = term(APP, [result, arg]);
     }
     return result
   }
   force = ([val_id, payload], ctx) => {
     if (val_id !== VFLEX) return [val_id, payload];
-    const [, soln] = this.#metas.find(([m]) => m == payload[0]);
+    const soln = this.#metas[payload[0]];
     if (soln === null) return [val_id, payload];
     const newVal = this.vAppSp(soln, payload[1], ctx);
     return this.force(newVal, ctx)
   }
 
-  getNextMeta = () => this.#nextMeta++;
-  reset = () => {
-    this.#metas = [];
-    this.#nextMeta = 0
-  }
+  reset = () => this.#metas = []
   freshMeta = ([lvl, env, names, types, bds]) => {
-    const mvar = this.getNextMeta();
-    this.#metas.push([mvar, null]);
+    const mvar = this.#metas.length;
+    this.#metas.push(null);
     return term(IMETA, [mvar, bds])
   }
 
   bind = (vtype, name, [lvl, env, names, vtypes, bds]) => {
-    const freshVal = value(VRIGID, [lvl, []]),
-          newEnv = env.concat([freshVal]),
+    const newEnv = env.concat([freshVal(lvl)]),
           newNames = names.concat([name]),
           newTypes = vtypes.concat([vtype]),
           newBDs = bds.concat([true]);
@@ -694,18 +695,18 @@ class EvaluateHoles {
           dom++;
           continue
         }
-      } // TODO: use error codes
-      return [1, "Unification error: Must substitute on unblocked variable"];
+      }
+      return [1, [VARBLOCKED_ERR]];
     }
     return [0, [null, dom, lvl, ren]]
   }
   rename = (val, pren, ctx) => {
     const [fval_id, payload] = this.force(val, ctx),
           [occ, dom, cod, ren] = pren;
-    let err = 0, result, i, newTerm, newVal, newPren, freshVal, newDom;
+    let err = 0, result, newTerm, newVal, newPren;
     switch (fval_id) {
       case VFLEX:
-        if (occ === payload[0]) return [1, "Unification error: occurs check"];
+        if (occ === payload[0]) return [1, [OCCURS_ERR]];
         result = term(META, [payload[0]]);
         for (let i = 0; i < payload[1].length; i++) {
           ([err, newTerm] = this.rename(payload[1][i], pren, ctx));
@@ -717,8 +718,8 @@ class EvaluateHoles {
         }
         break;
       case VRIGID:
-        i = ren.findIndex(([c]) => c === payload[0]);
-        if (!~i) return [1, "Unification error: variable escapes scope"];
+        let i = ren.findIndex(([c]) => c === payload[0]);
+        if (!~i) return [1, [ESCAPESCOPE_ERR]];
         result = term(VAR, [dom - ren[i][1] - 1]);
         for (let i = 0; i < payload[1].length; i++) {
           ([err, newTerm]  = this.rename(payload[1][i], pren, ctx));
@@ -731,22 +732,19 @@ class EvaluateHoles {
         break;
       case VLAM:
         newPren = this.liftPRen(pren);
-        freshVal = value(VRIGID, [cod, []]);
-        newVal = this.cApp(freshVal, payload[1], payload[2], ctx);
+        newVal = this.cApp(freshVal(cod), payload[1], payload[2], ctx);
         ([err, result] = this.rename(newVal, newPren, ctx));
         if (err) break;
         result = term(LAM, [payload[0], result]);
         break;
       case VPI:
-        ([err, result] = this.rename(payload[1], pren, ctx));
+        ([err, newTerm] = this.rename(payload[1], pren, ctx));
         if (err) break;
-        newDom = result;
         newPren = this.liftPRen(pren);
-        freshVal = value(VRIGID, [cod, []]);
-        newVal = this.cApp(freshVal, payload[2], payload[3], ctx);
+        newVal = this.cApp(freshVal(cod), payload[2], payload[3], ctx);
         ([err, result] = this.rename(newVal, newPren, ctx));
         if (err) break;
-        result = term(PI, [payload[0], newDom, result]);
+        result = term(PI, [payload[0], newTerm, result]);
         break;
       case VU:
         result = term(U, [])
@@ -755,7 +753,7 @@ class EvaluateHoles {
   }
 
   solve = (val, spine, lvl, mvar, ctx) => {
-    let err, newPren, result, i;
+    let err, newPren, result;
     ([err, newPren] = this.invertPRen(spine, lvl, ctx));
     if (err) return [1, newPren];
     newPren[0] = mvar;  // occurs check
@@ -764,9 +762,7 @@ class EvaluateHoles {
     for (let i = newPren[1]; i > 0; i--)
       result = term(LAM, ["x" + i, result]);
     result = this.eval(result, [], ctx);
-    i = this.#metas.findIndex(([m]) => m === mvar);
-    if (~i) this.#metas[i][1] = result;
-    else this.#metas.push([mvar, result]);
+    this.#metas[mvar] = result;
     return [0]
   }
   unify = (val0, val1, lvl, ctx) => {
@@ -777,10 +773,8 @@ class EvaluateHoles {
     else if (fval0_id === VPI && fval1_id === VPI) {
       ([err, result] = this.unify(payload0[1], payload1[1], lvl, ctx));
       if (!err) {
-        const freshVal0 = value(VRIGID, [lvl, []]),
-              val0 = this.cApp(freshVal0, payload0[2], payload0[3], ctx),
-              freshVal1 = value(VRIGID, [lvl, []]),
-              val1 = this.cApp(freshVal1, payload1[2], payload1[3], ctx);
+        const val0 = this.cApp(freshVal(lvl), payload0[2], payload0[3], ctx),
+              val1 = this.cApp(freshVal(lvl), payload1[2], payload1[3], ctx);
         ([err, result] = this.unify(val0, val1, lvl + 1, ctx))
       }
     }
@@ -789,34 +783,28 @@ class EvaluateHoles {
     else if (fval0_id === VFLEX && fval1_id === VFLEX && payload0[0] === payload1[0])
       ([err, result] = this.unifySp(payload0[1], payload1[1], lvl, ctx));
     else if (fval0_id === VLAM && fval1_id === VLAM) {
-      const freshVal0 = value(VRIGID, [lvl, []]),
-            val0 = this.cApp(freshVal0, payload0[1], payload0[2], ctx),
-            freshVal1 = value(VRIGID, [lvl, []]),
-            val1 = this.cApp(freshVal1, payload1[1], payload1[2], ctx);
+      const val0 = this.cApp(freshVal(lvl), payload0[1], payload0[2], ctx),
+            val1 = this.cApp(freshVal(lvl), payload1[1], payload1[2], ctx);
       ([err, result] = this.unify(val0, val1, lvl + 1, ctx))
     } else if (fval0_id === VLAM) {
-      const freshVal0 = value(VRIGID, [lvl, []]),
-            val0 = this.cApp(freshVal0, payload0[1], payload0[2], ctx),
-            freshVal1 = value(VRIGID, [lvl, []]),
-            val1 = this.vApp([fval1_id, payload1], freshVal1, ctx);
+      const val0 = this.cApp(freshVal(lvl), payload0[1], payload0[2], ctx),
+            val1 = this.vApp([fval1_id, payload1], freshVal(lvl), ctx);
       ([err, result] = this.unify(val0, val1, lvl + 1, ctx))
     }
     else if (fval1_id === VLAM) {
-      const freshVal0 = value(VRIGID, [lvl, []]),
-            val0 = this.vApp([fval0_id, payload0], freshVal0, ctx),
-            freshVal1 = value(VRIGID, [lvl, []]),
-            val1 = this.cApp(freshVal1, payload1[1], payload1[2], ctx);
+      const val0 = this.vApp([fval0_id, payload0], freshVal(lvl), ctx),
+            val1 = this.cApp(freshVal(lvl), payload1[1], payload1[2], ctx);
       ([err, result] = this.unify(val0, val1, lvl + 1, ctx))
     }
     else if (fval0_id === VFLEX)
       ([err, result] = this.solve([fval1_id, payload1], payload0[1], lvl, payload0[0], ctx))
     else if (fval1_id === VFLEX)
       ([err, result] = this.solve([fval0_id, payload0], payload1[1], lvl, payload1[0], ctx))
-    else ([err, result] = [1, "Unification error: rigid mismatch"]);
+    else ([err, result] = [1, [RIGIDMISMATCH_ERR]]);
     return [err, result]
   }
   unifySp = (sp0, sp1, lvl, ctx) => {
-    if (sp0.length !== sp1.length) return [1, "Unification error: rigid mismatch"];
+    if (sp0.length !== sp1.length) return [1, [RIGIDMISMATCH_ERR]];
     for (let i = 0; i < sp0.length; i++) {
       const [err, msg] = this.unify(sp0[i], sp1[i], lvl, ctx);
       if (err) return [1, msg]
@@ -825,11 +813,11 @@ class EvaluateHoles {
   }
   unifyCatch = (val0, val1, ctx) => {
     const [lvl, env, names, vtypes, bds] = ctx,
-          [err, msg] = this.unify(val0, val1, lvl, ctx);
+          [err, errdata] = this.unify(val0, val1, lvl, ctx);
     if (err) {
       const term0 = this.quote(val0, lvl, ctx),
             term1 = this.quote(val1, lvl, ctx);
-      return [1, `${msg}\nCan't unify\n\t${termstr(term0, names)}\nwith\n\t${termstr(term1, names)}`]
+      return [1, [UNIFY_COMBINING_ERR, ...errdata, termstr(term0, names), termstr(term1, names)]]
     } else return [0]
   }
 
@@ -840,16 +828,14 @@ class EvaluateHoles {
     let err, result;
     if (rterm_id === RLAM && fvtype_id === VPI) {
       const newCtx = this.bind(payloadfv[1], payloadr[0], ctx),
-            freshVal = value(VRIGID, [lvl, []]),
-            newVal = this.cApp(freshVal, payloadfv[2], payloadfv[3], newCtx);
+            newVal = this.cApp(freshVal(lvl), payloadfv[2], payloadfv[3], newCtx);
       ([err, result] = this.check(payloadr[1], newVal, newCtx));
       if (!err) result = term(LAM, [payloadr[0], result])
     }
     else if (rterm_id === RLET) {
-      const lnames = [], types = [], terms = [], newCtx = ctx;
+      const lnames = [], types = [], terms = [], newCtx = ctx, uVal = value(VU, []);
       for (let i = 0; i < payloadr[0].length; i++) {
         lnames.push(payloadr[0][i]);
-        const uVal = value(VU, []);
         ([err, result] = this.check(payloadr[1][i], uVal, newCtx));
         if (err) break;
         types.push(result);
@@ -877,7 +863,7 @@ class EvaluateHoles {
     return [err, result]
   }
   infer = ([rterm_id, payloadr], ctx) => {
-    let err = 0, result, vtype, dom, newCtx, newVal, tm;
+    let err = 0, result, vtype, tm, dom, newVal, newCtx;
     const [lvl, env, names, vtypes, bds] = ctx,
           uVal = value(VU, []);
     switch (rterm_id) {
@@ -887,7 +873,7 @@ class EvaluateHoles {
         if (~i) {
           tm = term(VAR, [lvl - i - 1]);
           result = [vtypes[i], tm]
-        } else result = `Evaluator error: name not in scope "${payloadr[0]}"`
+        } else result = [UNSCOPEDNAME_ERR, payloadr[0]]
         break;
       case RLAM:
         const newMeta = this.freshMeta(ctx);
@@ -940,9 +926,8 @@ class EvaluateHoles {
         newCtx = this.bind(vtype, payloadr[0], ctx);
         ([err, result] = this.check(payloadr[2], uVal, newCtx));
         if (err) break;
-        vtype = uVal;
         tm = term(PI, [payloadr[0], dom, result]);
-        result = [vtype, tm];
+        result = [uVal, tm];
         break;
       case RLET:
         newCtx = ctx;
@@ -980,7 +965,7 @@ class EvaluateHoles {
     this.reset();
     // local context: [int lvl, value[] env, str[] names, value[] vtypes, bool[] bds]
     const [err, result] = this.infer(rterm, [0, [], [], [], []]);
-    if (err) return [err, this.displayError(result)];
+    if (err) return [err, this.displayError(...result)];
     else return [err, result]
   }
   returnAll = ([vtype, term]) => {
@@ -989,15 +974,26 @@ class EvaluateHoles {
           finalTerm = this.quote(finalVal, 0, ctx),
           finalType = this.quote(vtype, 0, ctx),
           metaCtx = [];
-    for (let i = 0; i < this.#metas.length; i++) {
-      let [mvar, soln] = this.#metas[i];
+    for (let mvar = 0; mvar < this.#metas.length; mvar++) {
+      let soln = this.#metas[mvar];
       if (soln !== null) soln = this.quote(soln, 0, ctx);
-      const entry = metaentry(mvar, soln);
-      metaCtx.push(entry)
+      metaCtx.push(soln)
     }
     return [ finalTerm, finalType, term, metaCtx ]  // [ term, type, elab, metas ]
   }
-  displayError = errmsg => errmsg
+  displayError = (code, ...args) => {
+    switch (code) {
+      case VARBLOCKED_ERR: return "Unification error: Must substitute on unblocked variable";
+      case OCCURS_ERR: return "Unification error: occurs check";
+      case ESCAPESCOPE_ERR: return "Unification error: variable escapes scope";
+      case RIGIDMISMATCH_ERR: return "Unification error: rigid mismatch";
+      case UNIFY_COMBINING_ERR: return (args.length > 3 ? this.displayError(args.slice(3)) : "") +
+        `${this.displayError(args[0])
+        }\nCan't unify\n\t${args[1]
+        }\nwith\n\t${args[2]}`;
+      case UNSCOPEDNAME_ERR: return `Evaluator error: name not in scope "${args[0]}"`
+    }
+  }
 
   constructor (state) {
     this.#source = state.source;
@@ -1012,13 +1008,12 @@ class EvaluateHoles {
 function value (id, payload) {
   return [id, payload]
 }
+function freshVal (lvl) {
+  return [VRIGID, [lvl, []]]
+}
 
 function term (id, payload) {
   return [id, payload]
-}
-
-function metaentry(mvar, soln) {  // Is mvar redundant here?
-  return [mvar, soln]
 }
 
 export async function evaluate(state) {
