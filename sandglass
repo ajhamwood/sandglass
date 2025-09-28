@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+
+import serial
+import signal
+import time
+from enum import Enum
+
+def interrupt(signum, frame):
+    print("\nExiting")
+    exit(1)
+
+signal.signal(signal.SIGINT, interrupt)
+
+def fail(msg):
+    print("\nFailed with error:\n\t" + msg)
+    exit(1)
+
+
+
+# Signal codes:
+#   Transmit to the microcontroller
+class TxSignals(Enum):
+    READY = 1
+    DATA = 2
+txsignals = {
+    TxSignals.READY: b'\x01',
+    TxSignals.DATA: b'\x02',
+}
+
+#   Receive from the microcontroller
+class RxSignals(Enum):
+    READY = 1
+    DATA = 2
+    ERR = 255
+rxsignals = {
+    b'\x01': RxSignals.READY,
+    b'\x02': RxSignals.DATA,
+    b'\xFF': RxSignals.ERR,
+}
+
+
+
+if __name__ == "__main__":
+    import sys
+
+    ser = serial.Serial()
+    ser.port = "/dev/ttyUSB0"
+    ser.baudrate = 9600
+    ser.bytesize = serial.EIGHTBITS
+    ser.parity = serial.PARITY_NONE
+    ser.stopbits = serial.STOPBITS_ONE
+    ser.timeout = 2
+
+    try:
+        ser.open()
+    except serial.SerialException as e:
+        sys.stderr.write("Couldn't open serial port {}:\n\t{}\n".format(ser.name, e))
+        exit(1)
+
+    ser.write(b'U') # Sync char
+    ser.flush()
+    time.sleep(.05) # >= 0.01
+
+    while True:
+
+        ser.write(txsignals[TxSignals.DATA])
+        ser.flush()
+
+        istr = input("Send> ")
+        ser.write((istr + '\x00').encode("utf-8"))
+        ser.flush()
+
+
+        # Wait for save signal
+        while ser.in_waiting == 0:
+            pass
+        sig = ser.read(1)
+        match rxsignals[sig]:
+            case RxSignals.ERR:
+                fail("Error")
+            case RxSignals.READY:
+                pass
+            case _:
+                fail("Unexpected signal: " + str(sig.hex()))
+
+        ser.write(txsignals[TxSignals.READY])
+        ser.flush()
+
+
+        # Wait for data
+        while ser.in_waiting == 0:
+            pass
+        sig = ser.read(1)
+        match rxsignals[sig]:
+            case RxSignals.DATA:
+                pass
+            case _:
+                fail("Unexpected signal: " + str(sig.hex()))
+
+        payload = ser.read(len(istr) + 1)
+        print("Receive> " + payload.decode(), flush=True)
