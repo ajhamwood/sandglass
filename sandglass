@@ -1,101 +1,1387 @@
-#!/usr/bin/env python3
-
-import serial
-import signal
-import time
-from enum import Enum
-
-def interrupt(signum, frame):
-    print("\nExiting")
-    exit(1)
-
-signal.signal(signal.SIGINT, interrupt)
-
-def fail(msg):
-    print("\nFailed with error:\n\t" + msg)
-    exit(1)
+#!/usr/bin/env node
+Error.stackTraceLimit = 50;
 
 
 
-# Signal codes:
-#   Transmit to the microcontroller
-class TxSignals(Enum):
-    READY = 1
-    DATA = 2
-txsignals = {
-    TxSignals.READY: b'\x01',
-    TxSignals.DATA: b'\x02',
+// CLI //
+const
+  fs = require("node:fs/promises"),
+  process = require("node:process"),
+  readline = require("node:readline"),
+  util = require("node:util"),
+  { SerialPort } = require("serialport"),
+  path = require("node:path");
+
+
+class TxSignals {
+  static Save = 1; static Delete = 2; static Eval = 3; static Param = 4; static Run = 5
+  static MemRQ = 6; static Dump = 7; static Read = 8; static List = 9; static Immed = 10
+  static Done = 63; static Debug = 127
+}
+class RxSignals {
+  static Ready = 1; static SaveOK = 2; static Mem = 3; static Ack = 4; static Result = 5
+  static Monitor = 6; static Info = 7
+  static MemErr = 63; static FrameErr = 62; static RangeErr = 61; static Nack = 60; static PgmErr = 59
+  static NotFound = 58
+}
+class States {
+  static Begin = 1; static Ready = 2; static Saving = 3; static Deleting = 4
+  static Applying = 5; static Eval = 6; static Running = 7; static Counting = 8
+  static Send = 9; static Dumping = 10; static Reading = 11; static Listing = 12
+  static Debugging = -1
+  // TODO Etc
 }
 
-#   Receive from the microcontroller
-class RxSignals(Enum):
-    READY = 1
-    DATA = 2
-    ERR = 255
-rxsignals = {
-    b'\x01': RxSignals.READY,
-    b'\x02': RxSignals.DATA,
-    b'\xFF': RxSignals.ERR,
+// CLI argument parsing options
+const
+  rl = readline.createInterface({ input: process.stdin, output: process.stdout }),
+  argParseOptions = {
+    help: { type: 'boolean', short: 'h',
+      desc: 'Display this help message.' },
+    languageHelp: { type: 'boolean', short: 'g',
+      desc: 'Display description of lambda calculus syntax.' },
+    listFiles: { type: 'boolean', short: 'l',
+      desc: 'List all sandglass files saved on MCU.' },
+    uploadInline: { type: 'string', short: 'u',
+      desc: 'Upload an inline-defined sandglass file to MCU EEPROM' },
+    uploadFile: { type: 'string', short: 'U',
+      desc: 'Upload a sandglass file to MCU EEPROM.' },
+    fileName: { type: 'string', short: 'n',
+      desc: 'Set filename for sandglass file (use with upload options).' },
+    dryRun: { type: 'boolean', short: 'y',
+      desc: 'Parse file and generate bytecode without uploading.' },
+    read: { type: 'string', short: 'r',
+      desc: 'Read a sandglass file from MCU by index.' },
+    readFile: { type: 'string', short: 'R',
+      desc: 'Read a sandglass file from MCU.' },
+    delete: { type: 'string', short: 'd',
+      desc: 'Delete a file from MCU by index.' },
+    deleteFile: { type: 'string', short: 'D',
+      desc: 'Delete a file from MCU.' },
+    dump: { type: 'boolean', short: 'M',
+      desc: 'Delete all files from MCU.' },
+    evaluate: { type: 'string', short: 'e',
+      desc: 'Evaluate a file by index.' },
+    evaluateFile: { type: 'string', short: 'E',
+      desc: 'Evaluate a file.' },
+    immediateInline: { type: 'string', short: 'i',
+      desc: 'Immediately evaluate an inline-defined sandglass file without uploading it.' },
+    immediateFile: { type: 'string', short: 'I',
+      desc: 'Immediately evaluate a sandglass file without uploading it.' },
+    // paramInline: { type: 'string', short: 'p', multiple: true },
+    // paramFile: { type: 'string', short: 'P', multiple: true }
+    showDefns: { type: 'boolean', short: 's',
+      desc: 'Show top-level definitions.' },
+    unfoldTop: { type: 'boolean', short: 'f',
+      desc: 'Unfold top-level definitions (by default no unfolding is done).' },
+    verbose: { type: 'boolean', short: 'v', multiple: true,
+      desc: 'Set verbosity, up to -vv (mostly for debugging purposes).' },
+
+    // Uncomment for debugging
+    debug: { type: 'string', short: 'x', multiple: true,
+      desc: 'Ayy I\'m debuggin\' here!' },
+  },
+  encode = (() => { const te = new TextEncoder(); return str => te.encode(str) })(),
+  decode = (() => { const td = new TextDecoder(); return buf => td.decode(buf, "utf-8") })();
+
+rl.on('SIGINT', () => {
+  if (db_level >= 1) console.log("Exiting");
+  rl.close();
+  process.exit(1)
+});
+
+const cliCommand = util.parseArgs({
+  args: process.argv.slice(2), options: argParseOptions
+}).values;
+let params = [], sa_mod, emitbuf, file_buf, file_name;
+const db_level = cliCommand.verbose?.length ?? 0;
+let monitor_flag = false, peakmem = 2048; // Impossible, empty SRAM
+
+async function doCommand () {
+  if (db_level >= 2) console.log("cmd", cliCommand);
+  if (Object.keys(cliCommand).length === 0) {
+    port.write(String.fromCodePoint(TxSignals.Done));
+    process.exit(0);
+  }
+  if ("listFiles" in cliCommand) {
+    port.write(String.fromCodePoint(TxSignals.List));
+    state = States.Listing;
+  }
+  if ("uploadInline" in cliCommand) {
+    await gen_bytecode({
+      inlineCode: cliCommand.uploadInline,
+      uploadName: "fileName" in cliCommand ? /[^\.]{1,8}/.exec(path.basename(cliCommand.fileName))[0].padEnd(8) : "sandglas"
+    });
+    return
+  }
+  if ("uploadFile" in cliCommand) {
+    await gen_bytecode({
+      fileName: cliCommand.uploadFile,
+      uploadName: /[^\.]{1,8}/.exec(path.basename("fileName" in cliCommand ? cliCommand.fileName : cliCommand.uploadFile))[0].padEnd(8)
+    });
+    return
+  }
+  if ("immediateInline" in cliCommand) {
+    await gen_bytecode({
+      isImmed: true,
+      inlineCode: cliCommand.immediateInline
+    });
+    return
+  }
+  if ("immediateFile" in cliCommand) {
+    await gen_bytecode({
+      isImmed: true,
+      fileName: cliCommand.immediateFile
+    });
+    return
+  }
+  if ("read" in cliCommand) {
+    port.write(String.fromCodePoint(TxSignals.Read));
+    let index = parseInt(cliCommand.read);
+    if (isNaN(index)) indexNaN();
+    port.write(String.fromCodePoint(index));
+    state = States.Reading;
+    return
+  }
+  if ("readFile" in cliCommand) {
+    file_name = /[^\.]{1,8}/.exec(path.basename(cliCommand.readFile))[0].padEnd(8);
+    port.write(String.fromCodePoint(TxSignals.Read + 32));
+    port.write(file_name);
+    state = States.Reading;
+    return
+  }
+  if ("delete" in cliCommand) {
+    port.write(String.fromCodePoint(TxSignals.Delete));
+    let index = parseInt(cliCommand.delete);
+    if (isNaN(index)) indexNaN();
+    port.write(String.fromCodePoint(index));
+    state = States.Deleting;
+    return
+  }
+  if ("deleteFile" in cliCommand) {
+    file_name = /[^\.]{1,8}/.exec(path.basename(cliCommand.deleteFile))[0].padEnd(8);
+    port.write(String.fromCodePoint(TxSignals.Delete + 32));
+    port.write(file_name);
+    state = States.Deleting;
+    return
+  }
+  if (cliCommand.dump) {
+    port.write(String.fromCodePoint(TxSignals.Dump));
+    state = States.Dumping;
+    return
+  }
+  if ("evaluate" in cliCommand) {
+    port.write(String.fromCodePoint(TxSignals.Eval));
+    port.write(String.fromCodePoint(cliCommand.unfoldTop ? 1 : 0));
+    let index = parseInt(cliCommand.evaluate);
+    if (isNaN(index)) indexNaN();
+    port.write(String.fromCodePoint(index));
+    state = States.Applying
+    // if ("paramInline" in cliCommand /*|| "paramFile" in cliCommand*/)
+    //   params = cliCommand.paramInline;
+    return
+  }
+  if ("evaluateFile" in cliCommand) {
+    file_name = /[^\.]{1,8}/.exec(path.basename(cliCommand.evaluateFile))[0].padEnd(8);
+    port.write(String.fromCodePoint(TxSignals.Eval + 32));
+    port.write(String.fromCodePoint(cliCommand.unfoldTop ? 1 : 0));
+    port.write(file_name);
+    state = States.Applying
+    // if ("paramInline" in cliCommand /*|| "paramFile" in cliCommand*/)
+    //   params = cliCommand.paramInline;
+    return
+  }
+  if ("debug" in cliCommand) {
+    const
+      cmd = (256 + TxSignals.Debug) % 256,
+      arg = debug(...cliCommand.debug);
+    port.write(String.fromCodePoint(cmd));
+    port.write(String.fromCodePoint(cliCommand.unfoldTop ? 1 : 0));
+    port.write(varuint16_raw(arg.length));
+    if (arg.length) port.write(arg);
+    state = States.Debugging;
+    return
+  }
+}
+
+function read_varuint16 (bytes) {
+  if (bytes[0] < 128) return bytes[0];
+  else return (bytes[1] << 7) + (bytes[0] & 0x7f)
+}
+
+async function gen_bytecode ({ fileName, uploadName, inlineCode, isImmed }) {
+  file_name = uploadName;
+  let source;
+  if (fileName) {
+    try { source = await fs.readFile(fileName, { encoding: "utf-8" }) }
+    catch (err) {
+      console.log(`Could not open file "${fileName}"`);
+      if (db_level >= 1) console.log(`Error: ${err}`);
+      rl.emit("SIGINT");
+    }
+  } else if (inlineCode) source = inlineCode;
+  try { sa_mod = await new Text().run(source) }
+  catch (err) {
+    console.log("Could not parse" + (isImmed ? "" :  ` "${uploadName}"`));
+    if (db_level >= 1) console.log(`Error: ${err}`);
+    rl.emit("SIGINT");
+  }
+  let gen_code = "";
+  new Pretty(sa_mod, s => gen_code += s).print(true);
+
+  if (sa_mod.v[4].v.length > 128 || sa_mod.v[3].v[2].length > 127 ||
+    sa_mod.v[3].v[3].length > 127 || sa_mod.v[3].v[4].length > 127) {
+    console.log("Syntax tree too large"); // Max table size 127 (varuint7, max value codes null)
+    process.exit(0);
+  }
+
+  emitbuf = new Emitter(new ArrayBuffer(sa_mod.z));
+  sa_mod.emit(emitbuf);
+  file_buf = emitbuf.buffer;
+  if (db_level >= 2) {
+    console.log("Program buffer:\n", hexpretty(Buffer.from(file_buf)));
+    console.log(`\nsandglass module:`);
+    console.log(gen_code);
+  }
+
+  if ("dryRun" in cliCommand) {
+    console.log("File OK" + (isImmed ? "" :  ` "${uploadName}"`));
+    process.exit(0)
+  }
+
+  if (isImmed) {
+    const size = varuint16_raw(sa_mod.z);
+    port.write(String.fromCodePoint(TxSignals.Immed));
+    port.write(String.fromCodePoint(cliCommand.unfoldTop ? 1 : 0));
+    port.write(Buffer.from(size));
+    port.write(Buffer.from(file_buf));
+    state = States.Running
+  }
+  else {
+    port.write(String.fromCodePoint(TxSignals.MemRQ));
+    state = States.Counting;
+  }
+}
+
+function debug (...args) {
+  return args.filter(Boolean).map(s => [parseInt(s)]).reduce((a, x) => a.concat(Array.from(x)), [])
+}
+
+function hexpretty (file = []) {
+  const sp = file.toString('hex').match(/../g) ?? [], pretty = [], k = [];
+  while (sp.length > 32) {
+    const chunk = sp.splice(0, 32), k = [];
+    while (chunk.length) k.push(chunk.splice(0, 8).join(" "))
+    pretty.push(k.join("  "))
+  }
+  while (sp.length > 8) k.push(sp.splice(0, 8).join(" "));
+  pretty.push(k.concat(sp.join(" ")).join("  "));
+  return pretty.join("\n ");
+}
+function db_str (tarr) {
+  let pre_len = 0;
+  const
+    indent = read_varuint16(tarr),
+    mem = Int16Array.from([ read_varuint16(tarr.subarray(pre_len = indent < 128 ? 1 : 2)) << 1 ])[0] >> 1;
+  return ' '.repeat(2 * indent) + decode(tarr.subarray(pre_len + (mem < 128 ? 1 : 2))) + `   mem=${mem}`;
+}
+
+function indexNaN () {
+  console.log("Error: NaN applied to index-based argument");
+  rl.emit("SIGINT")
 }
 
 
 
-if __name__ == "__main__":
-    import sys
-
-    ser = serial.Serial()
-    ser.port = "/dev/ttyUSB0"
-    ser.baudrate = 9600
-    ser.bytesize = serial.EIGHTBITS
-    ser.parity = serial.PARITY_NONE
-    ser.stopbits = serial.STOPBITS_ONE
-    ser.timeout = 2
-
-    try:
-        ser.open()
-    except serial.SerialException as e:
-        sys.stderr.write("Couldn't open serial port {}:\n\t{}\n".format(ser.name, e))
-        exit(1)
-
-    ser.write(b'U') # Sync char
-    ser.flush()
-    time.sleep(.05) # >= 0.01
-
-    while True:
-
-        ser.write(txsignals[TxSignals.DATA])
-        ser.flush()
-
-        istr = input("Send> ")
-        ser.write((istr + '\x00').encode("utf-8"))
-        ser.flush()
+// Help
+if ("help" in cliCommand) {
+  console.log("Evaluate normal form of lambda calculus on MCU.");
+  console.log("Usage: ./sandglass [options]");
+  for (const key in argParseOptions) {
+    const option = argParseOptions[key];
+    console.log(`  --${key}, -${option.short}`.padEnd(25, " ") + option.desc);
+  }
+}
+if ("help" in cliCommand && "languageHelp" in cliCommand) console.log();
+if ("languageHelp" in cliCommand) {
+  console.log("* Lambda calculus syntax rules *");
+  console.log("Let expressions / Top-level structure:");
+  console.log('  let-expr  =  "let"  name  "="  term  ";"  (let-expr | term)');
+  console.log("Functions:");
+  console.log('  term      =  "\\"  name {name}  "."  term');
+  console.log("Function application (left associative):");
+  console.log('  term      =  term term');
+  console.log("Parentheses:");
+  console.log('  term      =  "("  term  ")"');
+  console.log("Comments:");
+  console.log('  ∅         =  "--" { non-newline-char } "\\n"');
+}
+if ("help" in cliCommand || "languageHelp" in cliCommand) process.exit(0);
 
 
-        # Wait for save signal
-        while ser.in_waiting == 0:
-            pass
-        sig = ser.read(1)
-        match rxsignals[sig]:
-            case RxSignals.ERR:
-                fail("Error")
-            case RxSignals.READY:
-                pass
-            case _:
-                fail("Unexpected signal: " + str(sig.hex()))
 
-        ser.write(txsignals[TxSignals.READY])
-        ser.flush()
+// Initialise
+let startResolver, startPromise = new Promise(r => startResolver = r);
+let state;
+const port = new SerialPort({ path: '/dev/ttyUSB0', baudRate: 38400 }, async () => {  // Autoopen
+  await startPromise;
+  port.write(Buffer.from('U')); // TODO remove - no longer autodetecting baud rate
+  port.pause();
+  if (db_level >= 1) console.log("State = Begin");
+  state = States.Begin;
+  await new Promise(r => setTimeout(r, 50));
+  port.resume()
+});
 
 
-        # Wait for data
-        while ser.in_waiting == 0:
-            pass
-        sig = ser.read(1)
-        match rxsignals[sig]:
-            case RxSignals.DATA:
-                pass
-            case _:
-                fail("Unexpected signal: " + str(sig.hex()))
 
-        payload = ser.read(len(istr) + 1)
-        print("Receive> " + payload.decode(), flush=True)
+// Main
+let serialOffset = null, serialLength = 0;
+port.on("data", async data => {
+  port.pause();
+  if (serialOffset == null) serialOffset = data.offset;
+  serialLength += data.length;
+  data = Buffer.from(data.buffer, serialOffset, serialLength);
+  let cmd = data.readInt8(0);
+  // if (serialOffset === 0) while (serialLength > 1 && cmd != -2) {
+  //   data = Buffer.from(data.buffer, ++serialOffset, --serialLength);
+  //   cmd = data.readInt8(0);
+  // }
+  if (serialOffset === 0 && serialLength > 0 && cmd != -2) {
+    data = Buffer.from(data.buffer, ++serialOffset, --serialLength);
+    cmd = data.readInt8(0);
+  }
+  if (db_level >= 2) console.log("on data", data.offset, data);
+  let prev_len;
+  while (serialLength && prev_len != serialLength) {
+    if (prev_len !== undefined && db_level >= 2) console.log("data", data.offset, data);
+    prev_len = serialLength;
+    switch (cmd) {
+      case -2: if (state) rl.emit("SIGINT");
+        else startResolver();
+        serialOffset++;
+        serialLength--;
+        break;
+
+      case RxSignals.Ready: if (state === States.Begin) {
+        const
+          ixlen = data.readInt8(1), freebytes = data.readInt16LE(2),
+          lens = Array(ixlen).fill(0).map(({}, i) => data.readInt16LE(4 + 2 * i))
+            .map((p, i, ar) => (i ? p - ar[i - 1] : p) - 8);
+        if (db_level == 0) console.log(`EEPROM usage: ${ixlen} program${ixlen === 1 ? "" : "s"}, freebytes=${freebytes}`);
+        else if (db_level >= 1) console.log("Rx = Ready, State = Ready, summary:", ixlen, freebytes, lens);
+        state = States.Ready;
+        const data_len = 4 + 2 * ixlen
+        serialOffset += data_len;
+        serialLength -= data_len;
+        await doCommand();
+      }
+      break;
+
+      case RxSignals.Info: if (state === States.Listing) {
+        if (serialLength < 2) break;
+        const i_len = data[1];
+        if (serialLength < 2 + 10 * i_len) break;
+        const pgms = Array(i_len).fill(0).map(({}, i) => [
+          decode(data.subarray(2 + i * 10, (i + 1) * 10)),
+          data.readInt16LE((i + 1) * 10).toString().padStart(4)
+        ]);
+        console.log("Program list:", ...pgms.map(([n, s], i) => `\n${i.toString().padStart(3)}. ${n} ${s} bytes`));
+        state = States.Ready;
+        const data_len = 2 + 8 * i_len;
+        serialOffset += data_len;
+        serialLength -= data_len;
+        process.exit(0)
+      }
+      break;
+  
+      case RxSignals.SaveOK: if (state === States.Saving) {
+        if (serialLength < 12) break;
+        const
+          index = data[1],
+          len = data.readInt16LE(2),
+          name = decode(new Uint8Array(data.subarray(4, 12)));
+        if (db_level == 0) console.log(`Save ok "${name}"`);
+        else if (db_level >= 1) console.log("Rx = SaveOK, State = Ready, data:", index, len, name);
+        state = States.Ready;
+        const data_len = 12;
+        serialOffset += data_len;
+        serialLength -= data_len;
+        process.exit(0)
+      }
+      break;
+  
+      case RxSignals.Mem:
+      if (serialLength < 2 || (serialLength < 3 && data[1] >= 128)) break;
+      const freebytes = read_varuint16(data.subarray(1));
+      const data_len = freebytes > 127 ? 3 : 2;
+      serialOffset += data_len;
+      serialLength -= data_len;
+      if (db_level >= 1) console.log("Rx = Mem, State = Send, free bytes:", freebytes);
+      if (state === States.Counting) {
+        state = States.Send;
+        if (freebytes < sa_mod.z && cliCommand.debug?.[0] !== "skip_memrq") {
+          console.log(`Not enough memory (${freebytes} bytes) for program (${sa_mod.z} bytes)`);
+          state = States.Ready;
+          process.exit(1)
+        } else {
+          console.log(`In free memory (${freebytes} bytes) saving program (${sa_mod.z} bytes)`);
+          const size = varuint16_raw(sa_mod.z);
+          port.write(String.fromCodePoint(TxSignals.Save));
+          port.write(Buffer.from(size));
+          port.write(Buffer.from(file_name));
+          port.write(Buffer.from(file_buf)); // TODO frame this!
+          state = States.Saving
+        }
+      } else if (state === States.Deleting) {
+        if (db_level == 0) console.log(`Delete ok, ${freebytes} free bytes`);
+        state = States.Ready;
+        process.exit(0)
+      } else if (state === States.Dumping) {
+        if (db_level == 0) console.log(`Dump ok, ${freebytes} free bytes`);
+        state = States.Ready;
+        process.exit(0)
+      }
+      break;
+  
+      case RxSignals.Ack: if (state === States.Applying) {
+        if (serialLength < 2) break;
+        if (db_level >= 1) console.log("Rx = Ack, State = Eval, cmd:", data[1]);
+        state = States.Eval;
+        let param = params.shift();
+        if (param !== undefined) {
+          port.write(String.fromCodePoint(TxSignals.Param));
+          state = States.Applying
+        } else {
+          port.write(String.fromCodePoint(TxSignals.Run));
+          state = States.Running
+        }
+        const data_len = 2;
+        serialOffset += data_len;
+        serialLength -= data_len;
+      }
+      break;
+  
+      case RxSignals.Result:
+      if (state === States.Reading) {
+        if (serialLength < 2 || (serialLength < 3 && data[1] >= 128)) break;
+        const rx_len = read_varuint16(data.subarray(1));
+        const sof = rx_len > 127 ? 3 : 2;
+        if (serialLength < sof + 8 + rx_len) break;
+        const name = decode(data.subarray(sof, sof + 8));
+        const rx_file = data.subarray(sof + 8, sof + 8 + rx_len);
+        if (db_level >= 1) console.log("Result buffer:\n", hexpretty(rx_file));
+        const parser = new Bytecode(), mod = await parser.run(rx_file, "bytecode");
+        let code = "";
+        new Pretty(mod, s => code += s).print("showDefns" in cliCommand);
+        if ("showDefns" in cliCommand) console.log(`\nsandglass module "${name}":`);
+        console.log(code);
+  
+        state = States.Ready;
+        const data_len = sof + 8 + rx_len;
+        serialOffset += data_len;
+        serialLength -= data_len;
+        process.exit(0)
+  
+      } else if (state === States.Running) {
+        if (serialLength < 2 || (serialLength < 3 && data[1] >= 128)) break;
+        const rx_len = read_varuint16(data.subarray(1));
+        const sof = rx_len > 127 ? 3 : 2;
+        if (serialLength < sof + rx_len) break;
+        const rx_file = data.subarray(sof, sof + rx_len);
+        if (db_level >= 1) console.log("Result buffer:\n", hexpretty(rx_file));
+        try {
+          let code = "";
+          const mod = await new Bytecode().run(rx_file, "bytecode");
+          new Pretty(mod, s => code += s).print("showDefns" in cliCommand);
+          if ("showDefns" in cliCommand) console.log("\nsandglass module:");
+          console.log(code);
+        } catch (err) {
+          console.log("Error: could not parse bytecode");
+          rl.emit("SIGINT")
+        }
+  
+        state = States.Ready;
+        const data_len = sof + rx_len;
+        serialOffset += data_len;
+        serialLength -= data_len;
+        process.exit(0);
+        
+      } else if (state === States.Debugging) {
+        if (serialLength < 3 || (serialLength < 4 && data[2] >= 128)) break;
+        const db_flags = data[1];
+        const db_len = read_varuint16(data.subarray(2));
+        const sof = db_len > 127 ? 4 : 3;
+        if (serialLength < sof + db_len) break;
+        const db_file = data.subarray(sof, sof + db_len);
+        if (db_level >= 2) console.log("Receiving debug info, length:", db_len);
+        const info = (db_flags & 0x4 ? db_str : hexpretty)(db_file);
+        if (db_level == 0) console.log(">" + info);
+        else if (db_level >= 1) console.log("Rx = Result, State = Ready, length:", db_len, ", debug info:\n", info);
+        if (db_flags & 0x8) {
+          const mod = await new Bytecode().run(db_file, "bytecode");
+          let code = "";
+          new Pretty(mod, s => code += s).print("showDefns" in cliCommand);
+          if ("showDefns" in cliCommand) console.log("\nsandglass module:");
+          console.log(code);
+        }
+        const data_len = sof + db_len;
+        serialOffset += data_len;
+        serialLength -= data_len;
+        if (!(db_flags & 0x2)) state = States.Ready;
+        if (db_flags & 0x1) process.exit(0);
+      }
+      break;
+
+      case RxSignals.Monitor: {
+        if (state === States.Running) {
+          if (serialLength < 2 || (serialLength < 3 && data[1] >= 128)) break;
+          const 
+            rawmem = read_varuint16(data.subarray(1)),
+            mem = Int16Array.from([ rawmem << 1 ])[0] >> 1;
+          if (monitor_flag) readline.moveCursor(process.stdout, 0, -1);
+          monitor_flag = true;
+          peakmem = mem < peakmem ? mem : peakmem;
+          console.log(`Peak SRAM usage: freebytes=${peakmem.toString().padEnd(4, " ")}`);
+          const data_len = rawmem < 128 ? 2 : 3;
+          serialOffset += data_len;
+          serialLength -= data_len;
+        }
+      }
+      break;
+  
+      case RxSignals.MemErr: {
+        if (serialLength < 2 || (serialLength < 3 && data[1] >= 128)) break;
+        const freebytes = read_varuint16(data.subarray(1));
+        if (db_level == 0) console.log(`MemErr (${freebytes} free bytes)`);
+        else if (db_level >= 1) console.log("Rx = MemErr, State = Ready, free bytes:", freebytes);
+        state = States.Ready;
+        const data_len = freebytes > 127 ? 3 : 2;
+        serialOffset += data_len;
+        serialLength -= data_len;
+        process.exit(0)
+      }
+  
+      case RxSignals.RangeErr: {
+        if (serialLength < 2) break;
+        if (db_level == 0) console.log(`RangeErr (count = ${data[1]})`);
+        else if (db_level >= 1) console.log("Rx = RangeErr, State = Ready, count:", data[1]);
+        state = States.Ready;
+        const data_len = 2;
+        serialOffset += data_len;
+        serialLength -= data_len;
+        process.exit(0)
+      }
+  
+      case RxSignals.NotFound: {
+        if (serialLength < 2 || serialLength < 2 + 8 * data[1]) break;
+        const count = data[1];
+        if (serialLength < 2 + count * 8) break;
+        if (db_level == 0) console.log(`NotFound (name = ${file_name})`);
+        else if (db_level >= 1) {
+          console.log("Rx = NotFound, State = Ready, name:", file_name);
+          if (serialLength < 2 + 8 * count) break;
+          const names = Array(count).fill(0).map(({}, i) => data.subarray(2 + i * 8, 2 + (i + 1) * 8));
+          console.log("Program list:", ...names.map(n => `\n* ${decode(n)}`));
+        }
+        state = States.Ready;
+        const data_len = 2 + 8 * count;
+        serialOffset += data_len;
+        serialLength -= data_len;
+        process.exit(0)
+      }
+  
+      default: throw "Unexpected signal: " + data[0]
+    }
+    if (serialLength == 0) break;
+    data = Buffer.from(data.buffer, serialOffset, serialLength);
+    cmd = data.readInt8(0);
+  }
+  port.resume()
+});
+
+
+
+// Parser //
+
+// Three-valued error handling: success, fail, error
+class Result {
+  // Constructors
+  static pure (v) { return new Result(r => r(v)) }
+  static throw (e) { return new Result(({}, l) => l(e)) }
+  static fail () { return new Result(({}, {}, f) => f()) }
+
+  static #SUCCESS = 0
+  static #FAIL = 1
+  static #ERROR = 2
+
+  #state = { valence: Result.#SUCCESS, value: null }
+
+  // Wrapper functions
+  #success = v => (this.#state.valence = Result.#SUCCESS, v)
+  #fail = () => (this.#state.valence = Result.#FAIL, null)
+  #error = e => (this.#state.valence = Result.#ERROR, e)
+
+  // Chaining
+  #join = (fn, v = this.#state.value) => {
+    const r = this.#state.value = fn(v, this.#error, this.#fail);
+    if (Result.prototype.isPrototypeOf(r)) {
+      const x = r.unwrap();
+      return this.#state.value = "ok" in x ? this.#success(x.ok) :
+        "fail" in x ? this.#fail() : this.#error(x.err)
+    }
+  }
+
+  // Success/Fail/Error -> Success
+  then = (ok, err, fail) => {
+    switch (this.#state.valence) {
+      case Result.#SUCCESS: if (ok) this.#join(ok.bind(this)); break;
+      case Result.#FAIL: if (fail) this.#join(() => this.#success(fail())); break;
+      case Result.#ERROR: if (!err) break;
+        this.#state.valence = Result.#SUCCESS;
+        this.#join(err.bind(this))
+    }
+    return this
+  }
+
+  // Error -> Success
+  catch = fn => {
+    if (this.#state.valence === Result.#ERROR) {
+      this.#state.valence = Result.#SUCCESS;
+      this.#join(fn.bind(this))
+    }
+    return this
+  }
+
+  // Error -> Fail
+  try = () => {
+    if (this.#state.valence === Result.#ERROR) this.#join(this.#fail);
+    return this
+  }
+
+  // Fail -> Success
+  fails = fn => {
+    switch (this.#state.valence) {
+      case Result.#SUCCESS: this.#join(this.#fail); break;
+      case Result.#FAIL:
+        this.#state.valence = Result.#SUCCESS;
+        this.#join(fn.bind(this));
+    }
+    return this
+  }
+
+  // Fail -> Error
+  cut = e => {
+    if (this.#state.valence === Result.#FAIL) this.#join(() => this.#error(e));
+    return this
+  }
+
+  // Extract
+  unwrap = () => ({ [
+    ({
+      [Result.#SUCCESS]: "ok",
+      [Result.#FAIL]: "fail",
+      [Result.#ERROR]: "err"
+    })[this.#state.valence]
+  ]: this.#state.value })
+
+  toPromise = () => new Promise((ok, err) => this.then(s => ok(s), e => err(e)))
+
+  constructor (fn) { return fn.bind(this)(
+    v => this.#join(() => this.#success(v)), // In C, include pointer to rest of input buffer
+    e => this.#join(() => this.#error(e)),
+    () => this.#join(() => this.#fail())
+  ) }
+}
+
+
+
+// AST
+class Emitter {
+  constructor (buffer) {
+    this.view = new DataView(this.buffer = buffer)
+    this.length = 0
+  }
+  writeU8 (v) {
+    this.view.setUint8(this.length++, v);
+    return this
+  }
+  writeU16 (v) {
+    this.view.setUint16(this.length, v, true);
+    this.length += 2;
+    return this
+  }
+  writeBytes (bytes) {
+    for (const byte of bytes) this.view.setUint8(this.length++, byte);
+    return this
+  }
+}
+
+// Type tags
+const T = {
+  // Atoms
+  uint8:      Symbol("u8"),
+  uint16:     Symbol("u16"),
+  varuint16:  Symbol("vu16"),
+
+  // Cells
+  module:     Symbol("module"),
+  section:    Symbol("section"),
+  term_table: Symbol("term_table"),
+  name:       Symbol("name"),
+  app_term:   Symbol("app_term"),
+  lam_term:   Symbol("lam_term"),
+  let_term:   Symbol("let_term"),
+  term_ref:   Symbol("term_ref"),
+
+  str:        Symbol("str")
+};
+
+// Nodes
+const
+  // (Emitter, [Emittable]) -> Emitter
+  writev = (e, objs) => objs.reduce((e, n) => n.emit(e), e),
+  // [N] -> number
+  sumz = ns => ns.reduce((sum, { z }) => sum += z, 0);
+
+// val_atom T : Atom T
+class val_atom {
+  // (TypeTag, uint32, T) -> val_atom T
+  constructor (t, z, v) { this.t = t; this.z = z; this.v = v }
+  emit (e) { return e }
+}
+
+// T : number, (val_atom T) (bytesval_atom T) => bytesval_atom
+class bytesval_atom extends val_atom {
+  // (TypeTag, T, ArrayLike uint8) -> bytesval_atom T
+  constructor (t, v, bytes) {
+    super(t, bytes.length, v);
+    this.bytes = bytes
+  }
+  emit (e) { return e.writeBytes(this.bytes) }
+}
+
+// T : number, (val_atom T) (u8_atom T) => u8_atom T
+class u8_atom extends val_atom {
+  // (TypeTag, T) -> u8_atom T
+  constructor (t, v) { super(t, 1, v) }
+  emit (e) { return e.writeU8(this.v) }
+}
+
+// (val_atom uint16) u16_atom => u16_atom
+class u16_atom extends val_atom {
+  // uint16 -> u16_atom
+  constructor (v) { super(T.uint16, 2, v) }
+  emit (e) { return e.writeU16(this.v) }
+}
+
+// str_atom : Atom (ArrayLike uint8)
+class str_atom {
+  // (VarUint16, ArrayLike uint8) -> str_atom
+  constructor (len, v) { this.t = T.str; this.z = len.z + v.length; this.v = v; this.len = len }
+  emit (e) { return this.len.emit(e).writeBytes(this.v) }
+}
+
+// T : N => cell T : Cell T
+class cell {
+  // (TypeTag, [T]) -> cell T
+  constructor (t, v) { this.t = t; this.z = sumz(v); this.v = v }
+  emit (e) { return writev(e, this.v) }
+}
+
+// Constructors
+const
+  uint8Cache = Array(5).fill(0).map(({}, i) => new u8_atom(T.uint8, i)),
+  varUint16Cache = Array(16).fill(0).map(({}, i) => new bytesval_atom(T.varuint16, i, [i]));
+  
+function uint8 (v) { return uint8Cache[v] || new u8_atom(T.uint8, v) }  // uint8 -> Uint8
+function uint16 (v) { return new u16_atom(v) }  // uint16 -> Uint16
+function varuint16 (value) {  // uint16 -> VarUint16
+  const c = varUint16Cache[value];
+  if (c) return c;
+  return new bytesval_atom(T.varuint16, value, varuint16_raw(value))
+}
+function varuint16_raw (value) {
+  let v = value;
+  const bytes = []  // [uint8]
+  if (v >= 0x80) {
+    bytes.push((v & 0x7f) | 0x80);
+    v >>>= 7  // Unsigned right shift
+  }
+  bytes.push(v);
+  return bytes
+}
+
+// Actually varint7 length...
+function str (data) { return new str_atom(uint8(data.length), data) }
+
+const
+  signature = uint16(0xC0DE), // TODO choose something
+  sect_id = {
+    top_names:   uint8(0), // TODO is varuint7 better?
+    local_names: uint8(1),
+    terms:       uint8(2),
+    defns:       uint8(3),
+    result:      uint8(4)
+  },
+  term_kind = {
+    top: uint8(0),
+    loc: uint8(1),
+    app: uint8(2),
+    lam: uint8(3),
+    let: uint8(4),
+  },
+
+  // API
+  t = T,
+  c = {
+    uint8,
+    uint16,
+    varuint16,
+    str,
+    sect_id,
+    term_kind,
+
+    module: sections => new cell(T.module, [ signature, ...sections ]),
+    section: (id, data) => new cell(T.section, [ id, varuint16(sumz(data)), ...data ]),
+
+    top_names: names => c.section(sect_id.top_names, names),
+    local_names: names => c.section(sect_id.local_names, names),
+    terms: term_tables => c.section(sect_id.terms, term_tables),
+    defns: term_refs => c.section(sect_id.defns, term_refs),
+    result: term_ref => c.section(sect_id.result, [ term_ref ]),
+
+    term_table: terms => new cell(T.term_table, [ varuint16(sumz(terms)), ...terms ]),
+
+    app_term: (func_ref, arg_ref) => new cell(T.app_term, [ func_ref, arg_ref ]),
+    lam_term: (name_ref, arg_ref) => new cell(T.lam_term, [ name_ref, arg_ref ]),
+    let_term: (name_ref, term_ref, result_ref) => new cell(T.let_term, [ name_ref, term_ref, result_ref ]),
+    
+    term_ref: (term_kind, data_ref) => new cell(T.term_ref, [ term_kind, data_ref ])
+  };
+
+
+
+// Pretty print AST
+class Pretty {
+  #atFirstChar = true; #atFirstLine = true; #atNewLine = true; #supSp = false; #writer
+  constructor (mod, writer) {
+    this.module = mod;
+    this.#writer = writer
+  }
+  writeln (chunk, { depth, atNewLine = this.#atNewLine }) {
+    this.#writer((this.#atFirstLine ? "" : "\n") + "  ".repeat(depth) + chunk);
+    this.#atFirstChar = false;
+    this.#atFirstLine = false
+    this.#atNewLine = atNewLine
+    this.#supSp = false
+  }
+  write (chunk, { depth, atNewLine = this.#atNewLine }) {
+    this.#atNewLine = atNewLine
+    if (atNewLine) this.writeln(chunk, { depth, atNewLine });
+    else this.#writer((this.#supSp ? "" : " ") + chunk);
+    this.#atFirstChar = false;
+    this.#supSp = false
+  }
+
+  #depth = 0; #ctx = {}; #showDefns
+  print (showDefns) {
+    this.#showDefns = showDefns;
+    this.visit(this.module)
+  }
+  visitAll (ns) { for (let n of ns) this.visit(n) }
+  visit (n, { prec = false, depth = 0 } = {}) {
+    switch (n.t) {
+      case T.module: {
+        const sections = n.v.slice(1);
+        for (const section of sections) switch (section.v[0]) {
+          case sect_id.top_names:   this.#ctx.top_names = section.v.slice(2); break
+          case sect_id.local_names: this.#ctx.local_names = section.v.slice(2); break
+          case sect_id.terms:       this.#ctx.terms = section.v.slice(2); break
+          case sect_id.defns:       this.#ctx.defns = section.v.slice(2); break
+          case sect_id.result:      this.#ctx.result = section.v[2];
+        }
+        if (this.#showDefns) for (let i = 0; i < this.#ctx.defns.length; i++)
+          this.write(`let ${decode(this.#ctx.top_names[i].v)} = ${this.visit(this.#ctx.defns[i], { depth })};`, { depth, atNewLine: true });
+        this.write(this.visit(this.#ctx.result, { depth, atNewLine: true }), { depth })
+      }
+      
+      case T.term_ref: {
+        const [ term_kind, ref ] = n.v;
+        switch (term_kind) {
+          case c.term_kind.top: return decode(this.#ctx.top_names[ref.v].v);
+          case c.term_kind.loc: return decode(this.#ctx.local_names[ref.v].v);
+          case c.term_kind.app: {
+            const [ func, arg ] = this.#ctx.terms[0].v[ref.v + 1].v;
+            const str = func.v[0].v === 2 ?
+              `${this.visit(this.#ctx.terms[0].v[func.v[1].v + 1].v[0], { depth })} ${
+                this.visit(this.#ctx.terms[0].v[func.v[1].v + 1].v[1], { prec: true, depth })} ${this.visit(arg, { prec: true, depth })}` :
+              `${this.visit(func, { prec: true, depth })} ${this.visit(arg, { prec: true, depth })}`;
+            return prec ? `(${str})` : str
+          }
+          case c.term_kind.lam: {
+            const goLam = body => {
+              if (body.v[0].v === 3) {
+                const [ binder, expr ] = this.#ctx.terms[1].v[body.v[1].v + 1].v;
+                return ` ${decode(this.#ctx.local_names[binder.v].v)}${goLam(expr)}`
+              } else return `. ${this.visit(body, { depth })}`
+            }
+            const [ binder, expr ] = this.#ctx.terms[1].v[ref.v + 1].v;
+            let str = `\\${decode(this.#ctx.local_names[binder.v].v)}${goLam(expr)}`;
+            return prec ? `(${str})` : str
+          }
+          case c.term_kind.let: {
+            const goLet = (binder, expr, next) => {
+              let s = `let ${decode(this.#ctx.local_names[binder.v].v)} = ${this.visit(expr, { depth })};\n`;
+              atNewLine = true;
+              if (next.v[0].v == 4) s += "  ".repeat(depth) + goLet(...this.#ctx.terms[2].v[next.v[1].v + 1].v);
+              else s += "  ".repeat(depth) + this.visit(next, { depth });
+              return s;
+            };
+            let atNewLine = false;
+            if (!this.#showDefns && this.#atFirstChar) return goLet(...this.#ctx.terms[2].v[ref.v + 1].v);
+            else {
+              let str = "  ".repeat(depth) + "( "
+              depth++;
+              str += goLet(...this.#ctx.terms[2].v[ref.v + 1].v);
+              depth--;
+              str += " )";
+              return str;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+
+
+// Parser data
+// const
+//   encode = (() => { const te = new TextEncoder(); return str => te.encode(str) })(),
+//   decode = (() => { const td = new TextDecoder(); return buf => td.decode(buf, "utf-8") })();
+
+class ParserData {
+  id; comb; value
+  constructor ({ id, comb }) {
+    const self = this;
+    this.id = id;
+    this.comb = comb.bind(this);
+    this.value = this.id()
+  }
+}
+
+class ConstantData extends ParserData {
+  constructor (k) {
+    super({ id: () => k, comb (v) { return this } })
+  }
+  clone () { return new WrappedData(this.value) }
+}
+
+class WrappedData extends ParserData {
+  constructor (v) {
+    super({ id: () => null, comb (v) {
+      if (v !== undefined) this.value = v;
+      return this
+    } });
+    if (v !== undefined) this.comb(v)
+  }
+  clone () { return new WrappedData(this.value) }
+}
+
+class SummableData extends ParserData {
+  constructor (v) {
+    super({ id: () => new v.constructor(), comb (v) {
+      if (v !== undefined) this.value += v;
+      return this
+    } })
+    this.comb(v)
+  }
+  clone () { return new SummableData(this.value) }
+}
+
+class ArrayData extends ParserData {
+  constructor (...v) {
+    super({ id: () => [], comb (v) {
+      if (v !== undefined) this.value[this.value.length] = v;
+      return this
+    } })
+    for (let val of v) this.comb(val)
+  }
+  clone () { return new ArrayData(...this.value.slice()) }
+}
+
+class RowColData extends ParserData {
+  constructor (v) {
+    super({ id: () => [ 0, 0 ], comb (v) { // Not a real identity, should start at [0, 0]
+      if (v !== undefined) {
+        const [ row0, col0 ] = this.value, [ row1, col1 ] = v;
+        this.value = [ row0 + row1, row1 === 0 ? col0 + col1 : col1 ]
+      }
+      return this
+    } });
+    if (v !== undefined) this.comb(v)
+  }
+  clone () { return new RowColData(this.value.slice()) }
+}
+
+class MultiData extends ParserData {
+  constructor (obj) {
+    super({
+      id () {
+        const id = {};
+        for (const k of Object.keys(obj)) id[k] = obj[k].value;
+        return id
+      },
+      comb (val) { // Test if same constructor?
+        for (const k in this.value)
+          if (val[k] !== undefined) {
+            this[k] = this[k].comb(val[k].value);
+            this.value[k] = this[k].value
+          }
+        return this
+      } 
+    });
+    for (const k in obj) this[k] = obj[k];
+    return this
+  }
+  clone () {
+    const cloneObj = {};
+    for (const k in this.value) cloneObj[k] = this[k].clone();
+    return new MultiData(cloneObj)
+  }
+  replace (obj) {
+    for (let [k, v] of Object.entries(obj)) if (k in this.value) {
+      this[k] = v;
+      this.value[k] = v.value
+    };
+    return this
+  }
+}
+
+
+
+// Parser
+class Parser {
+
+  static getNext = state => state.source.value[state.offset.value]
+
+  static any (state) { return new Result((ok, {}, fail) => {
+    const { source, offset, rowcol, type } = state.value;
+    if (source.length <= offset) return fail();
+    const value = type === "text" ? Parser.getNext(state).charCodeAt(0) : Parser.getNext(state);
+    // console.log("@any", offset, rowcol, `"${type === "text" ? String.fromCodePoint(value) : value}"`);
+    state.comb({
+      offset: new SummableData(1),
+      rowcol: new RowColData(type === "text" && value === 10 ? [ 1, 0 ] : [ 0, 1 ]),
+      data: new WrappedData(value),
+    });
+    return ok(state)
+  })}
+  
+  static eof (state) { return new Result((ok, {}, fail) => {
+    const { source, offset, rowcol } = state.value;
+    return offset < source.length ? fail() : ok(state)
+  }) }
+
+  // Operations on results with MultiData
+  static mapFull (p, fn) { return state => p(state).then(s => fn(s)) }
+  static map (p, fn) { return state => p(state).then(s => s.replace({ data: fn(s.data) })) }
+  static reqlFull (p, q) { return state => p(state.clone()).then(() => q(state)) }
+  static reql (p, q) { return state => p(state.clone()).then(s => q(s.replace({ data: state.data }))) }
+  static reqrFull (p, q) { return state => p(state).then(s => q(s.clone()).then(() => s)) }
+  static reqr (p, q) { return state => p(state).then(s0 => q(s0.clone()).then(s1 => s1.replace({ data: s0.data }))) }
+
+  static tap (p, fn) { return state => p(state).then(s => (fn(s.clone()), s)) }
+
+  static seq (...ps) { return state => ps.reduce((a, p) => a.then(p), Result.pure(state)) }
+  static do (...ps) { return state => ps.reduceRight((a, p) => (...ss) => p(...ss.map(s => s.clone())).then(s => a(...ss, s)))(state) }
+
+  static alt (p, q) { return state => p(state.clone()).then(null, null, () => q(state)) }
+  static choice (...ps) { return state => ps.reduce((a, p) => Parser.alt(a, p), Result.fail)(state) }
+  static option (p) { return state => Parser.alt(p, Result.pure)(state) }
+  static many (p, some) { return state => {
+    let s = state.clone().replace({ data: new ArrayData() });
+    const loop = t => p(t).then(t => (s = t.clone().replace({ data: s.data.comb(t.data.value) }), loop(t)));
+    return loop(state).fails(() => some && s.data.value.length === 0 ? Result.fail() : s) } }
+
+  static satisfyFull (pred) { return state => Parser.any(state.replace({ data: new WrappedData() }))
+    .then(s => pred(s) ? s : Result.fail()) }
+  static satisfyChar (pred) { return state => Parser.any(state.replace({ data: new WrappedData() }))
+    .then(s => pred(String.fromCodePoint(s.data.value)) ? s : Result.fail()) }
+  static satisfy (pred) { return state => Parser.any(state.replace({ data: new WrappedData() }))
+    .then(s => pred(s.data.value) ? s : Result.fail()) }
+  static guardFull (pred) { return state => pred(state) ? Result.pure(state) : Result.fail() }
+  static guard (pred) { return state => pred(state.data.value) ? Result.pure(state) : Result.fail() }
+
+  static take (n, p) { return state => p(state.clone())
+    .then(Parser.guardFull(s => s.offset.value - state.offset.value === n)) }
+  static takeMany(n, p) { return state => Parser.many(s =>
+    Parser.guardFull(() => s.offset.value - state.offset.value < n)(s)
+    .then(() => p(s.clone())))(state) }
+
+
+  language = () => Result.pure(null)
+  async run (file, type) {
+    const state = this.mkState(file, type);
+    const { ok, err, fail } = this.language(state).unwrap();
+    if (ok) return ok.data.value;
+    if (err) throw err;
+    if (fail === null) throw "Fail"
+  }
+
+}
+
+
+// Text -> AST
+class Text extends Parser {
+  static #term_kind = [ term_kind.top, term_kind.loc, term_kind.app, term_kind.lam, term_kind.let ]
+
+  static ws (some) {
+    return state => Parser.many(Parser.choice(
+      Parser.satisfyChar(c => /\s/.test(c)),
+      // Comments
+      Parser.seq(Text.symbol("--"), Parser.many(Parser.satisfyChar(c => /./.test(c)), false))
+    ), some)(state.clone()).then(s => s.replace({ data: state.data }))
+  }
+  static letter (state) { return Parser.satisfyChar(c => /(?=\D)\w/.test(c))(state) }
+  static digit (state) { return Parser.satisfyChar(c => /\d/.test(c))(state) }
+  static alphanum (state) { return Parser.satisfyChar(c => /\w/.test(c))(state) }
+  static token (str, some = true) { return Parser.reqr(Text.symbol(str), Text.ws(some)) }
+  static symbol (str) { let i = 0; return state => Parser.many(Parser.satisfyChar(c => c === str[i++]))(state)
+    .then(s => s.data.value.length == str.length ? s.replace({ data: new WrappedData(str) }) : Result.fail()) }
+    
+  static ident (isToken) { return state => Text.reqr(Parser.do(
+    Text.letter, ({}, head) => Parser.map(Parser.many(Text.alphanum, false),
+      tail => new WrappedData([ head.data.value ].concat(tail.value).map(v => String.fromCodePoint(v)).join("")))(head.clone())
+  ), isToken ? Text.ws(true) : Result.pure /*Parser.option(Parser.eof)*/)(state).then(Parser.guard(v => v !== "let")) } // .cut("identifier")
+
+  static atom (isToken) { return state => Parser.reqr(
+    Parser.alt(
+      Parser.mapFull(Text.ident(false), id => {
+        const top_i = id.sect.top_names.value.findIndex(cell => decode(cell.v) === id.data.value);
+        if (~top_i) return id.replace({ data: new WrappedData(c.term_ref(term_kind.top, c.uint8(top_i))) });
+        const loc_i = id.sect.local_names.value.findIndex(cell => decode(cell.v) === id.data.value);
+        if (~loc_i) return id.replace({ data: new WrappedData(c.term_ref(term_kind.loc, c.uint8(loc_i))) });
+        return Result.throw("Identifier out of scope") // TODO make more informative
+      }),
+      Text.parens(Text.term)),
+    Text.ws(isToken))(state) }
+  static parens (p) { return Parser.reql(Text.token("(", false), Parser.reqr(p, Text.symbol(")"))) }
+
+  static spine (state) { return Parser.seq(
+    Parser.many(Parser.reqrFull(Text.atom(true), Parser.any), false), init => Parser.mapFull(Text.atom(false),
+      last => {
+        if (init.data.value.length === 0) return last;
+        let i = last.sect.terms.app_terms.value.length, arg = last.data.value, func = init.data.value.pop();
+        const j = i;
+        while (init.data.value.length) {
+          last.sect.terms.app_terms.comb(c.app_term(c.term_ref(term_kind.app, c.varuint16(++i)), arg));
+          ([ arg, func ] = [ func, init.data.value.pop() ]);
+        }
+        last.sect.terms.app_terms.comb(c.app_term(func, arg));
+        return last.replace({ data: new WrappedData(c.term_ref(term_kind.app, c.varuint16(j))) })
+      })(init.clone().replace({ data: new WrappedData() })))(state) }
+
+  static lam (state) { return Parser.do(
+    Parser.seq(Text.token("\\", false), Parser.many(Text.ident(true), false)),
+    ({}, init) => Parser.mapFull(Text.ident(false), last => {
+      for (const binder of init.data.value.concat([ last.data.value ]))
+        last.sect.local_names.value.find(cell => decode(cell.v) === binder) ??
+          last.sect.local_names.comb(c.str(encode(binder)));
+      return last
+    })(init.clone().replace({ data: new WrappedData() })),
+    ({}, init, last) => Parser.mapFull(Parser.seq(Text.token("."), Text.term), expr => {
+      let i = expr.sect.terms.lam_terms.value.length; const j = i;
+      for (const binder of init.data.value) {
+        const loc_i = expr.sect.local_names.value.findIndex(cell => decode(cell.v) === binder);
+        expr.sect.terms.lam_terms.comb(c.lam_term(c.varuint16(loc_i), c.term_ref(term_kind.lam, c.varuint16(++i))))
+      }
+      const loc_i = expr.sect.local_names.value.findIndex(cell => decode(cell.v) === last.data.value);
+      expr.sect.terms.lam_terms.comb(c.lam_term(c.varuint16(loc_i), expr.data.value));
+      return expr.replace({ data: new WrappedData(c.term_ref(term_kind.lam, c.varuint16(j))) })
+    })(last.clone().replace({ data: new WrappedData() })))(state) }
+
+  static let (isTop) { return state => Parser.seq(
+    Parser.many(x => Parser.do(
+      Parser.seq(Text.token("let"), Text.ident(true)),
+      ({}, name) => Parser.mapFull(Parser.seq(Text.token("="), Parser.reqr(Text.term, Text.token(";", false))), expr => {
+        if (isTop) {
+          if (expr.sect.top_names.value.findIndex(cell => decode(cell.v) === name.data.value) !== -1)
+            return Result.throw("Top level definition already exists"); // TODO make more informative
+          expr.sect.top_names.comb(c.str(encode(name.data.value)))
+        } else if (expr.sect.local_names.value.findIndex(cell => decode(cell.v) === name.data.value) === -1)
+          expr.sect.local_names.comb(c.str(encode(name.data.value)));
+        return expr.replace({ data: new WrappedData([ name.data.value, expr.data.value ]) })
+      })(name.clone()))(x), !isTop),
+    bindings => Parser.mapFull(Text.term, result => {
+      if (isTop) {
+        for (const [ , expr_ref] of bindings.data.value) result.sect.defns.comb(expr_ref);
+        result.sect.result.comb(result.data.value);
+        return result.replace({ data: new WrappedData(c.module([
+          c.top_names(result.sect.top_names.value),
+          c.local_names(result.sect.local_names.value),
+          c.terms([
+            c.term_table(result.sect.terms.app_terms.value),
+            c.term_table(result.sect.terms.lam_terms.value),
+            c.term_table(result.sect.terms.let_terms.value)
+          ]),
+          c.defns(result.sect.defns.value),
+          c.result(result.sect.result.value)
+        ])) })
+      } else {
+        let i = result.sect.terms.let_terms.value.length, res_ref = result.data.value;
+        do {
+          let [ name_str, expr_ref ] = bindings.data.value.pop();
+          let loc_i = result.sect.local_names.value.findIndex(cell => decode(cell.v) === name_str);
+          if (!~loc_i) loc_i = result.sect.local_names.comb(c.str(encode(name_str))); // Shouldn't happen, right?
+          result.sect.terms.let_terms.comb(c.let_term(c.varuint16(loc_i), expr_ref, res_ref));
+          res_ref = c.term_ref(term_kind.let, c.varuint16(i++))
+        } while (bindings.data.value.length);
+        return result.replace({ data: new WrappedData(res_ref) })
+      }
+    })(bindings.clone().replace({ data: new WrappedData() })))(state) }
+
+  static term (state) { return Parser.choice(Text.spine, Text.lam, Text.parens(Text.let(false)))(state) }
+
+  language = Parser.seq(Text.ws(false), Text.let(true), Text.ws(false), Parser.eof)
+
+  mkState (source = "", type = "text") {
+    const dataObj = new MultiData({
+      // "text" or "bytecode"
+      type: new ConstantData(type),
+      // Uint8Array
+      source: new ConstantData(source),
+      // Current parsing location
+      offset: new SummableData(0),
+      // Source [ row, column ] value
+      rowcol: new RowColData(),
+      // Any state data
+      data: new WrappedData(),
+      // Sections being built
+      sect: new MultiData({
+        top_names: new ArrayData(),
+        local_names: new ArrayData(),
+        terms: new MultiData({
+          app_terms: new ArrayData(),
+          lam_terms: new ArrayData(),
+          let_terms: new ArrayData()
+        }),
+        defns: new ArrayData(),
+        result: new WrappedData()
+      })
+    });
+    return dataObj
+  }
+}
+
+
+// Bytecode -> AST
+class Bytecode extends Parser {
+  static #term_kind = [ term_kind.top, term_kind.loc, term_kind.app, term_kind.lam, term_kind.let ]
+
+  // Matches a string of bytes and returns the match
+  static bstring (bs) { let i = 0; return state => Parser.many(Parser.satisfy(b => b === bs[i++]))(state)
+    .then(s => s.data.value.length === bs.length ? s.replace({ data: new WrappedData(bs) }) : Result.fail()) }
+  // Consumes n bytes and returns them
+  static bytes (n) { let i = 0; return state => Parser.many(Parser.satisfy(() => i++ < n))(state)
+    .then(s => s.replace({ data: new WrappedData(new Uint8Array(s.data.value)) })) }
+  // Consumes a length-headed string and returns it
+  static str (state) { return Bytecode.list(Parser.any)(state)
+    .then(s => s.replace({ data: new WrappedData(new Uint8Array(s.data.value)) })) }
+  // Repeats a parser on a length-headed string until it is no longer before the end, and returns a list of the results
+  static varuint16 (state) { return Parser.seq(Parser.any,
+    b0 => Parser.map(Parser.alt(Parser.guard(c => c < 0x80), Parser.any), b1 => {
+      if (b0.data.value < 0x80) return b0.data;
+      else return new WrappedData((b0.data.value & 0x7f) + (b1.value << 7))
+    })(b0.clone())
+  )(state) }
+  static list (p) { return state => Parser.seq(Bytecode.varuint16,
+    s => Parser.takeMany(s.data.value, p)(s.replace({ data: new WrappedData() })))(state) }
+
+  static section (state) { return Parser.seq(s => Parser.any(s.clone().replace({ data: new WrappedData() })),
+    s => {
+      switch (s.data.value) {
+        case sect_id.top_names.v: return Bytecode.top_names(s);
+        case sect_id.local_names.v: return Bytecode.local_names(s);
+        case sect_id.terms.v: return Bytecode.terms(s);
+        case sect_id.defns.v: return Bytecode.defns(s);
+        case sect_id.result.v: return Bytecode.result(s)
+      }
+    }
+  )(state) }
+
+  // *Actually varint7 length, can still use varuint16 to recognise
+  static top_names (state) { return Parser.tap(
+    Bytecode.list(Bytecode.str),
+    s => Bytecode.#top_names = c.top_names(s.data.value.map(c.str))
+  )(state) }
+  static local_names (state) { return Parser.tap(
+    Bytecode.list(Bytecode.str),
+    s => Bytecode.#local_names = c.local_names(s.data.value.map(c.str))
+  )(state) }
+
+  static terms (state) { let tblcnt = 0; return Parser.tap(
+    Bytecode.list(s1 => Bytecode.list([
+      Bytecode.app_term, Bytecode.lam_term, Bytecode.let_term
+    ][tblcnt++])(s1.clone().replace({ data: new WrappedData() }))),
+    s => Bytecode.#terms = c.terms(s.data.value.map(c.term_table))
+  )(state) }
+  static app_term (state) { return Bytecode.bytes(4)(state).then(s => s.replace({ data: new WrappedData(c.app_term(
+    c.term_ref(Bytecode.#term_kind[s.data.value[0]], c.varuint16(s.data.value[1])),
+    c.term_ref(Bytecode.#term_kind[s.data.value[2]], c.varuint16(s.data.value[3])))) })) }
+  // TODO varuint16 for index
+  static lam_term (state) { return Bytecode.bytes(3)(state).then(s => s.replace({ data: new WrappedData(c.lam_term(
+    c.varuint16(s.data.value[0]),
+    c.term_ref(Bytecode.#term_kind[s.data.value[1]], c.varuint16(s.data.value[2])))) })) }
+  // TODO varuint16 for index
+  static let_term (state) { return Bytecode.bytes(5)(state).then(s => s.replace({ data: new WrappedData(c.let_term(
+    c.varuint16(s.data.value[0]),
+    c.term_ref(Bytecode.#term_kind[s.data.value[1]], c.varuint16(s.data.value[2])),
+    c.term_ref(Bytecode.#term_kind[s.data.value[3]], c.varuint16(s.data.value[4]))
+  )) })) }
+  
+  static defns (state) { return Parser.tap(
+    Parser.reqlFull(
+      s => Parser.any(s).then(Parser.guard(v => v === (Bytecode.#top_names.v.length - 2) * 2)),
+      Bytecode.list(s => Bytecode.bytes(2)(s.clone().replace({ data: new WrappedData() })))),
+    s => Bytecode.#defns = c.defns(s.data.value.map(([b0, b1]) => c.term_ref(Bytecode.#term_kind[b0], c.varuint16(b1))))
+  )(state) }
+  static result (state) { return Parser.tap(
+    Parser.reqlFull(
+      s => Parser.any(s).then(Parser.guard(v => v === 2)),
+      Bytecode.list(Bytecode.bytes(2))),
+    s => Bytecode.#result = c.result(c.term_ref(Bytecode.#term_kind[s.data.value[0][0]], c.varuint16(s.data.value[0][1])))
+  )(state) }
+
+  
+  static #top_names; static #local_names; static #terms; static #defns; static #result
+  constructor () { // One at a time...
+    super();
+    Bytecode.#top_names = null;
+    Bytecode.#local_names = null;
+    Bytecode.#terms = null;
+    Bytecode.#defns = null;
+    Bytecode.#result = null
+  }
+  language = Parser.seq(Bytecode.bstring([0xDE, 0xC0]), Parser.map(Parser.many(Bytecode.section), s => new WrappedData(c.module([
+    Bytecode.#top_names, Bytecode.#local_names, Bytecode.#terms, Bytecode.#defns, Bytecode.#result
+  ]))), Parser.eof)
+
+  mkState (source = "", type = "text") {
+    const dataObj = new MultiData({
+      // "text" or "bytecode"
+      type: new ConstantData(type),
+      // Uint8Array
+      source: new ConstantData(source),
+      // Current parsing location
+      offset: new SummableData(0),
+      // Source [ row, column ] value
+      rowcol: new RowColData(),
+      // Any state data
+      data: new WrappedData(),
+    });
+    return dataObj
+  }
+}

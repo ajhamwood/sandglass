@@ -1,0 +1,6 @@
+let zero = \s z. z;
+let suc = \n s z. s (n s z);
+--let one = \s z. s z;
+let one = suc zero;
+let add = \a b s z. a s (b s z);
+(let o = \s z. s z; add o one)

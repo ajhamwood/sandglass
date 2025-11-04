@@ -1,0 +1,4 @@
+let nil = \c n. n;
+let cons = \a l c n. c a (l c n);
+let reverse = \l. l (\a acc as. acc (cons a as)) (\x. x) nil;
+reverse (cons (\i o. i) (cons (\i o. o) nil))

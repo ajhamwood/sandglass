@@ -53,6 +53,7 @@ ST    Z,      XH      ; UCSR0A
 LDI   XH,     (1 << RXEN0) | (1 << TXEN0)
 STD   Z+1,    XH      ; UCSR0B
 
+; FIXME should send ready signal
 
 
 loop:

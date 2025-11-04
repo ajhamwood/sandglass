@@ -1,0 +1,2 @@
+let zero = \s z. z;
+(let suc = \n s z. s (n s z); suc (suc zero))

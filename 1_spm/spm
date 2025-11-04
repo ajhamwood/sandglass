@@ -1,0 +1,60 @@
+#!/usr/bin/env node
+Error.stackTraceLimit = 50;
+
+const
+  fs = require("node:fs"),
+  process = require("node:process"),
+  readline = require("node:readline/promises"),
+  util = require("node:util"),
+  { SerialPort } = require("serialport"),
+  { autoDetect } = require('@serialport/bindings-cpp'),
+  Binding = autoDetect();
+
+class TxSignals { static Ready = 1; static Data = 2 }
+class RxSignals { static Ready = 1; static Data = 2; static Err = 255 }
+
+const
+  // port = new SerialPort({ path: '/dev/ttyUSB0', baudRate: 9600 }),
+  rl = readline.createInterface({ input: process.stdin, output: process.stdout }),
+
+  encode = (() => { const te = new TextEncoder(); return str => te.encode(str) })(),
+  decode = (() => { const td = new TextDecoder(); return buf => td.decode(buf, "utf-8") })();
+
+(async () => {
+  const port = await Binding.open({ path: '/dev/ttyUSB0', baudRate: 9600 });
+  rl.on('SIGINT', () => {
+    console.log("\nExiting");
+    port.close();
+    process.exit(1)
+  });
+
+  await port.write(Buffer.from(encode('U')));
+  await new Promise(r => setTimeout(r, 50));
+
+  while (1) {
+    await port.write(Buffer.from([ TxSignals.Data ]))
+    const istr = await rl.question("Send> ");
+    port.write(Buffer.from(encode(istr + '\0')))
+
+    // Wait for save signal
+    let sig = Buffer.from([0]);
+    await port.read(sig, 0, 1);
+    switch (sig[0]) {
+      case RxSignals.Err: throw "Error";
+      case RxSignals.Ready: break;
+      default: throw "Unexpected signal: " + sig[0]
+    }
+    await port.write(Buffer.from([ TxSignals.Ready ]));
+
+    // Wait for data
+    sig = Buffer.from([0]);
+    await port.read(sig, 0, 1);
+    switch (sig[0]) {
+      case RxSignals.Data: break;
+      default: throw "Unexpected signal: " + sig[0]
+    }
+    let payload = Buffer.from(new ArrayBuffer(istr.length + 1));
+    await port.read(payload, 0, istr.length + 1);
+    console.log("Receive> " + decode(payload))
+  }
+})()

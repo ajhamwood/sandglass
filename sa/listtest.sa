@@ -1,0 +1,3 @@
+let nil = \c n. n;
+let cons = \a l c n. c a (l c n);
+cons (\i o. i) (cons (\i o. o) nil)
