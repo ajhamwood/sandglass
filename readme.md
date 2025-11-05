@@ -2,6 +2,10 @@
 
 This is a personal project running from today 23 Sep 2025 until ~31 Oct while I take CSSE2010 Intro to Computer Systems at University of Queensland. The goal is to take a dependently typed functional programming language, design a binary format for it to be compiled into, write a bootloader for AVR that can save to flash memory, delete, and evaluate those programs with input, and a CLI that can interact with it.
 
+### Demo (untyped lambda calculus):
+
+![Asciinema cast](./demo.svg)
+
 ## Development plan
 
 ### ```Language design```

@@ -239,7 +239,6 @@ static void arena_free ();
 // Linked array
 static array *array_init (array*, size_t);
 static void *array_extend (array*);
-static void *array_shrink (array*);
 static array *array_copy (array*, array*);
 static void *array_access (array*, uint8_t);
 static uint8_t array_indexof (array*, void*);
@@ -659,11 +658,11 @@ static vect entry_to_vect (struct entry e, uint8_t bytes[11]) {
 }
 
 static void decimal (uint8_t *bytes, uint8_t n) {
-  if (n == 0) return 0;
+  if (n == 0) return;
   *(bytes + 7) = (n % 10) + 0x30;
-  if (n < 10) return 1;
+  if (n < 10) return;
   *(bytes + 6) = ((n / 10) % 10) + 0x30;
-  if (n < 100) return 2;
+  if (n < 100) return;
   *(bytes + 5) = (n / 100) + 0x30;
 }
 
@@ -753,13 +752,6 @@ static void *array_extend (array *a) {
     }
   }
   return (uint8_t*) l->data + a->size * (a->len++ ^ level);
-}
-static void *array_shrink (array *a) {
-  if (a->len == 0) return NULL;
-  uint8_t level = hibit(--a->len);
-  link *l = a->begin;
-  while (l->level < level && l->next) l = l->next;
-  return (uint8_t*) l->data + a->size * (a->len ^ level);
 }
 
 
@@ -879,7 +871,7 @@ static void fresh_pgm_name (vect name) { // TODO can improve for space-prefixed 
   uint8_t info[pgm_count * 8];
   vect names = { .len = pgm_count * 8, .bytes = info };
   get_pgm_names(names);
-  uint8_t i, k = 0, len;
+  uint8_t i, k = 0;
   do {
     if (k++) decimal(name.bytes, k - 1);
     for (i = 0; i < pgm_count; i++)
@@ -1466,7 +1458,7 @@ static val_ref eval (term_ref tm, array *env) {
     name = (vect_short*) array_access(&pgm.loc_names, let_term->index);
     *((ventry*) array_extend(env)) = (ventry) { .name = name, .value = eval(let_term->term, env) };
     result = eval(let_term->result, env);
-    array_shrink(env);
+    env->len--;
     break;
 
     default: result = (val_ref) { .id = 3 }; // TODO how to errors
@@ -1490,7 +1482,7 @@ static val_ref capp (vlam *vfunc, val_ref varg) {
   array *cls = array_access(&pgm.closures, vfunc->cl_ix);
   *((ventry*) array_extend(cls)) = (ventry) { .name = vfunc->binder, .value = varg };
   val_ref result = eval(vfunc->body, cls);
-  array_shrink(cls);
+  cls->len--;
 #ifdef DEBUG_NBE
   indent--;
   imm_debug((vect) { .len = 5, .bytes = qs.capp }, RET_STRING);
@@ -1611,7 +1603,7 @@ static term_ref quote (val_ref val, array *env) {
     val_ref nv = { .id = VLOC, .ix = pgm.vlocs.len - 1 };
     *((ventry*) array_extend(env)) = (ventry) { .name = nn, .value = nv };
     term_ref new_body = quote(capp(vm, nv), env);
-    array_shrink(env);
+    env->len--;
     *((lam*) array_extend(&pgm.lams)) = (lam) { .index = array_indexof(&pgm.loc_names, nn), .body = new_body };
     result = (term_ref) { .id = LAM, .ix = pgm.lams.len - 1 };
     break;
